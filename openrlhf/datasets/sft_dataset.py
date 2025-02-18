@@ -7,7 +7,7 @@ from torch.utils.data import Dataset
 from .utils import zero_pad_sequences
 
 
-def preprocess_data(data, input_template=None, input_key="input", output_key=None, apply_chat_template=None, multiturn=False):
+def preprocess_data(data, input_template=None, instruction_key=None, input_key="input", output_key=None, apply_chat_template=None, multiturn=False):
     if apply_chat_template:
         if output_key:
             prompt_message = data[input_key]
@@ -24,8 +24,12 @@ def preprocess_data(data, input_template=None, input_key="input", output_key=Non
             response = apply_chat_template(data[input_key], tokenize=False)[len(prompt) :]
     else:
         prompt = data[input_key]
-        if input_template:
-            prompt = input_template.format(prompt)
+        if input_template and instruction_key:
+            prompt = input_template.format(data[input_key], data[instruction_key])
+        elif input_template:
+            prompt = input_template.format(data[input_key])
+        else:
+            pass
         # output_key is None for continue pretrain
         response = data[output_key] if output_key else ""
     return prompt, response
@@ -65,6 +69,7 @@ class SFTDataset(Dataset):
         self.input_template = input_template
         self.input_key = getattr(self.strategy.args, "input_key", None)
         self.output_key = getattr(self.strategy.args, "output_key", None)
+        self.instruction_key = getattr(self.strategy.args, "instruction_key", None)
         self.apply_chat_template = getattr(self.strategy.args, "apply_chat_template", False)
 
         if self.apply_chat_template:
@@ -124,6 +129,7 @@ class SFTDataset(Dataset):
         prompt, response = preprocess_data(
             data,
             None if self.pretrain_mode else self.input_template,
+            self.instruction_key,
             self.input_key,
             self.output_key,
             apply_chat_template=None if self.pretrain_mode else self.apply_chat_template,
