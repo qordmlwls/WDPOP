@@ -186,6 +186,7 @@ def load_pretrained_models(  # pylint: disable=too-many-arguments
         device_map=device_map,
         torch_dtype=dtype,
         trust_remote_code=trust_remote_code,
+        # token="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",
         token=hf_token,
         **auto_model_kwargs,
     )
@@ -197,6 +198,7 @@ def load_pretrained_models(  # pylint: disable=too-many-arguments
         padding_side=padding_side,
         trust_remote_code=trust_remote_code,
         use_fast=(model.config.model_type != 'llama'),
+        # token="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",
         token=hf_token,
         **auto_tokenizer_kwargs,
     )
