@@ -149,3 +149,9 @@ core
 *jianh*
 *test_scripts*
 */checkpoint/*
+MCTS-DPO/MCTS-DPO/
+.vscode/
+MCTS-DPO/.vscode/
+checkpoint/
+*.json
+wandb/
