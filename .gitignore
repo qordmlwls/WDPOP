@@ -153,5 +153,5 @@ MCTS-DPO/MCTS-DPO/
 .vscode/
 MCTS-DPO/.vscode/
 checkpoint/
-*.json
+
 wandb/
