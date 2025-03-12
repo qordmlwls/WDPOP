@@ -139,6 +139,14 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
             trust_remote_code=self.args.trust_remote_code,
             hf_token=self.args.hf_token,
         )
+        self.actor_reference_model2, _ = load_pretrained_models(
+            self.args.actor_ref_model_name_or_path,
+            model_max_length=self.args.max_length,
+            padding_side='left',
+            auto_model_type=AutoModelForCausalLM,
+            trust_remote_code=self.args.trust_remote_code,
+            hf_token=self.args.hf_token,
+        )
         
         self.use_reward_model = False
         if self.args.reward_model_name_or_path:
@@ -322,6 +330,11 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
         )
         self.actor_reference_model.eval()
         
+        self.actor_reference_model2 = self._init_eval_engine(
+            model=self.actor_reference_model2,
+            ds_config=self.ds_eval_config,
+        )        
+        self.actor_reference_model2.eval()
         if self.use_reward_model:
             self.reward_model = self._init_eval_engine(
                 model=self.reward_model,
@@ -453,7 +466,7 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
         num_prompt_only_batches = len(self.prompt_only_dataloader)
         num_ptx_batches = len(self.ptx_dataloader)
         num_ptx_replicas = (num_prompt_only_batches + num_ptx_batches - 1) // num_ptx_batches
-        
+        num_step = 0
         for epoch in range(self.args.epochs):
             if epoch < epochs_trained: continue
             
@@ -484,9 +497,11 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
                         if not check_available(rl_batch, 
                                                eos_token_id=self.tokenizer.convert_tokens_to_ids("<|eot_id|>") if self.args.model_type == 'llama3' else self.tokenizer.eos_token_id,
                                                max_tokens=self.args.max_length, 
-                                               to_filter=self.args.filter):
+                                               to_filter=self.args.filter,
+                                               mcts_train_type=self.args.mcts_train_type):
                             continue
-                        rl_info = self.tsrl_step(**rl_batch)
+                        rl_info = self.tsrl_step(**rl_batch, num_step=num_step)
+                        num_step += 1
                         if rl_info is None or not len(rl_info): continue
                         torch.cuda.empty_cache()
                         self.logger.log(rl_info, step=self.global_step)
@@ -502,16 +517,25 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
                         progress_bar.update(1)
                         
                         if self.args.save_mcts_data:
+                            input_ids_list = ''
+                            if 'input_ids_list' in rl_batch:
+                                input_ids_list = 'input_ids_list'
+                            elif 'winner_input_ids_list' in rl_batch:
+                                input_ids_list = 'winner_input_ids_list'
+                            else:
+                                continue
                             prompt = self.tokenizer.batch_decode(rl_batch['prompts_list'][0], skip_special_tokens=False, clean_up_tokenization_spaces=False)
-                            generated = [self.tokenizer.batch_decode(seq, skip_special_tokens=False, clean_up_tokenization_spaces=False) for seq in rl_batch['input_ids_list']]
-                            init_values = [x for x in rl_batch['init_value_list']]
+                            generated = [self.tokenizer.batch_decode(seq, skip_special_tokens=False, clean_up_tokenization_spaces=False) for seq in rl_batch[input_ids_list]]
+                            # init_values = [x for x in rl_batch['init_value_list']]
                             # generated = [[text[len(prompt[0]):] for text in text_list] for i, text_list in enumerate(generated)]
+                            # rl_info['train/loss'] print
+                            self.logger.print(f"train/loss: {rl_info['train/loss']}")
                             generated = [[text for text in text_list] for i, text_list in enumerate(generated)]
                             with jsonlines.open(os.path.join(self.args.output_dir, 'mcts_rst_data.jsonl'), mode='a') as writer:
                                 writer.write_all([{
                                     'prompt': prompt[0], 
                                     'generated': generated,
-                                    'init_values': init_values,
+                                    # 'init_values': init_values,
                                 }])
                         
                         if self.global_step % self.args.save_interval == 0:

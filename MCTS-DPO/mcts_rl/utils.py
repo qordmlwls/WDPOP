@@ -278,19 +278,25 @@ def check_diversity(values):
     return False
 
 
-def check_available(rl_batch, max_tokens=512, eos_token_id=2, to_filter=False):
+def check_available(rl_batch, max_tokens=512, eos_token_id=2, to_filter=False, mcts_train_type='dpo'):
+    if mcts_train_type == 'dpo':
+        input_ids_list = 'input_ids_list'
+    elif mcts_train_type == 'wdpop':
+        input_ids_list = 'winner_input_ids_list'
+    else:
+        raise ValueError(f'Invalid MCTS training type: {mcts_train_type}')
     if len(rl_batch) < 3:
         return False
     if 'input_ids' in rl_batch:
         return len(rl_batch['input_ids']) >= 2 and eos_token_id in rl_batch['input_ids'][-1].tolist()
     if to_filter:
         # return check_diversity(rl_batch['init_value_list'])
-        if not len(rl_batch['input_ids_list']):
+        if not len(rl_batch[input_ids_list]):
             return False
-        if rl_batch['input_ids_list'][-1].size(-1) >= max_tokens and eos_token_id not in rl_batch['input_ids_list'][-1][-1]:
+        if rl_batch[input_ids_list][-1].size(-1) >= max_tokens and eos_token_id not in rl_batch[input_ids_list][-1][-1]:
             return False
         return rl_batch.get('prediction', [False])[-1] > 0.8 # or random.random() < .1
-    input_ids_list = rl_batch['input_ids_list']
+    input_ids_list = rl_batch[input_ids_list]
     counts = [
         input_ids.size(0) >= 2 and input_ids.size(-1) <= max_tokens and (input_ids[0] != input_ids[1]).nonzero().size(0)
         for input_ids in input_ids_list

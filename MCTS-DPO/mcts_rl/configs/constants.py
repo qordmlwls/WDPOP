@@ -85,8 +85,10 @@ EVAL_PROMPT_ASSISTANT: str = 'ANSWER:'
 
 LLAMA3_PROMPT_USER: str = '<|start_header_id|>user<|end_header_id|>\n\n{input}<|eot_id|>'
 LLAMA3_PROMPT_ASSISTANT: str = '<|start_header_id|>assistant<|end_header_id|>\n\n'
+# LLAMA3_PROMPT_ASSISTANT: str = '<|start_header_id|>assistant<|end_header_id|> Let\'s think step by step.\n\n'
 LLAMA3_EVAL_PROMPT_USER: str = '<|start_header_id|>user<|end_header_id|>\n\n'
 LLAMA3_EVAL_PROMPT_ASSISTANT: str = '<|start_header_id|>assistant<|end_header_id|>\n\n'
+# LLAMA3_EVAL_PROMPT_ASSISTANT: str = '<|start_header_id|>assistant<|end_header_id|> Let\'s think step by step.\n\n'
 LLAMA3_PROMPT_ASSISTANT_MCQ: str = '<|start_header_id|>assistant<|end_header_id|>\n\n'
 
 PROMPT_INPUT: str = PROMPT_BEGIN + PROMPT_USER + PROMPT_ASSISTANT

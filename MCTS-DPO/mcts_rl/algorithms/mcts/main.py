@@ -8,7 +8,7 @@ import torch.distributed as dist
 from transformers import SchedulerType
 from transformers.utils import is_torch_bf16_gpu_available, is_torch_tf32_available
 
-from mcts_rl.algorithms.mcts.trainer import MCTSTrainer
+from mcts_rl.algorithms.mcts.trainer import MCTSTrainer, MCTSWDPOPTrainer
 from mcts_rl.configs import get_deepspeed_eval_config, get_deepspeed_train_config
 from mcts_rl.datasets import parse_dataset
 from mcts_rl.logger import set_logger_level
@@ -36,6 +36,12 @@ def parse_arguments() -> argparse.Namespace:
         type=str,
         help='Path to the model checkpoint or its name.',
         required=True,
+    )
+    model_parser.add_argument(
+        '--hf_token',
+        type=str,
+        default=None,
+        help='The token used for the model.',
     )
     model_parser.add_argument(
         '--max_length',
@@ -446,6 +452,12 @@ def parse_arguments() -> argparse.Namespace:
         action='store_true',
         default=False,
     )
+    mcts_parser.add_argument(
+        '--mcts_train_type',
+        type=str,
+        default='dpo',
+        choices=['dpo', 'wdpop'],
+    )
 
     # Evaluation
     evaluation_parser = parser.add_argument_group('evaluation')
@@ -600,8 +612,10 @@ def main() -> None:
         fp16=args.fp16,
         bf16=args.bf16,
     )
-
-    trainer = MCTSTrainer(args, ds_train_config, ds_eval_config)
+    if args.mcts_train_type == 'dpo':
+        trainer = MCTSTrainer(args, ds_train_config, ds_eval_config)
+    else: # args.mcts_train_type == 'wdpop'
+        trainer = MCTSWDPOPTrainer(args, ds_train_config, ds_eval_config)
     trainer.train()
     trainer.save()
 

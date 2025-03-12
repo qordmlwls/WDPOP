@@ -63,10 +63,11 @@ class TreeConstructor(ABC, Generic[State, Action, Example]):
         self.search_config = search_config
         self.search_algo = search_algo
 
-    def __call__(self, example: Example, node=None, **kwargs) -> HasTerminalStateAndTrace[State]:
+    def __call__(self, example: Example, node=None, policy_model=None, **kwargs) -> HasTerminalStateAndTrace[State]:
         self.world_model.update_example(example)
         self.search_config.update_example(example)
         return self.search_algo(self.world_model, 
                                 self.search_config, 
                                 root_node=node, 
+                                policy_model=policy_model,
                                 **kwargs)

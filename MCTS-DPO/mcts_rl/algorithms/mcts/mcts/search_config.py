@@ -37,6 +37,7 @@ from mcts_rl.configs import (
 class SearchArgs(NamedTuple):
     ref_policy_model: deepspeed.DeepSpeedEngine
     base_tokenizer: PreTrainedTokenizerBase
+    ref_policy_model2: deepspeed.DeepSpeedEngine = None
     generation_config: GenerationConfig = None
     n_actions: int = 16
     n_init_actions: int = 16
@@ -79,6 +80,7 @@ class StepLMConfig(SearchConfig):
         self.negative_gen = args.negative_gen
         
         self.ref_policy_model = args.ref_policy_model
+        self.ref_policy_model2 = args.ref_policy_model2
         
         self.base_tokenizer = args.base_tokenizer
         self.generation_config = args.generation_config        
@@ -380,7 +382,7 @@ class StepLMConfig(SearchConfig):
             log_probs = self._gather_log_probabilities(logits[input_ids.size(-1)-1:-1, :], gen_ids.to(logits.device))
             embs = hidden_states[input_ids.size(-1):]
             # if add_kl:
-            ref_logits, _ = self._get_logits(seq_input_ids, attention_mask=seq_attention_mask)
+            ref_logits, _ = self._get_logits(seq_input_ids, attention_mask=seq_attention_mask, model=self.ref_policy_model2.module)
             ref_log_probs = self._gather_log_probabilities(ref_logits[input_ids.size(-1)-1:-1, :], gen_ids.to(ref_logits.device))
             # else:
             #     ref_log_probs = None
