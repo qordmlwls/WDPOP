@@ -107,6 +107,12 @@ def parse_arguments() -> argparse.Namespace:
         metavar='DATASET[:PROPORTION[:PATH]]',
         help='Dataset name(s) registered in the raw dataset.',
     )
+    dataset_parser.add_argument(
+        '--replay_buffer_capacity',
+        type=int,
+        default=500,
+        help='The capacity of the replay buffer.',
+    )
 
     # Training
     training_parser = parser.add_argument_group('training')
@@ -333,6 +339,11 @@ def parse_arguments() -> argparse.Namespace:
         '--iteration_interval',
         type=int,
         default=32,
+    )
+    training_parser.add_argument(
+        '--rl_batch_size',
+        type=int,
+        default=4,
     )
 
     # Generation Config

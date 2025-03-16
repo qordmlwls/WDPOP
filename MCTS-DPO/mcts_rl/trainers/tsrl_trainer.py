@@ -45,6 +45,7 @@ from mcts_rl.utils import (
     to_device,
     check_available,
 )
+from mcts_rl.replay_buffer import ReplayBuffer
 
 
 class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
@@ -108,6 +109,7 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
         self.gamma = 1.0
         self.gae_lambda = 0.95
         self.scale_coeff = self.args.scale_coeff
+        self.replay_buffer = ReplayBuffer(capacity=self.args.replay_buffer_capacity)
 
     def init_models(self) -> None:
         """Initialize model and tokenizer."""
@@ -500,6 +502,16 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
                                                to_filter=self.args.filter,
                                                mcts_train_type=self.args.mcts_train_type):
                             continue
+                        
+                        self.replay_buffer.add(rl_batch)
+
+                        if len(self.replay_buffer) >= self.args.rl_batch_size:
+                            sampled_batches = self.replay_buffer.sample(self.args.rl_batch_size)
+                        else:
+                            continue
+                        
+                        rl_batch = self.merge_rl_batches(sampled_batches)
+
                         rl_info = self.tsrl_step(**rl_batch, num_step=num_step)
                         num_step += 1
                         if rl_info is None or not len(rl_info): continue
@@ -564,6 +576,27 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
                 self.save(global_steps=self.global_step)
                 self.logger.log(self.eval(), step=self.global_step)
 
+    def merge_rl_batches(self, rl_batches: list[dict[str, Any]]) -> dict[str, Any]:
+        """
+        Merge a list of RL mini-batch dictionaries into a single dictionary.
+        Each key in the dictionaries is aggregated in a single list or value.
+        """
+        merged = {}
+        for single_batch in rl_batches:
+            for key, val in single_batch.items():
+                # Initialize if not present
+                if key not in merged:
+                    # If val is a list, we'll store a list-of-lists
+                    # If val is a single item, we'll store a list of items
+                    merged[key] = []
+                # If the field is already a list (e.g. prompts_list, input_ids_list, etc.), we extend
+                if isinstance(val, list):
+                    merged[key].extend(val)
+                else:
+                    # If it's a single item or scalar, just append
+                    merged[key].append(val)
+        return merged
+    
     def eval(self) -> dict[str, Any]:
         """Evaluate the model on the evaluation dataset."""
         if self.eval_dataloader is None:

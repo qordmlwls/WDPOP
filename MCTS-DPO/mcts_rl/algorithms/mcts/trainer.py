@@ -669,6 +669,8 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         
         mini_batches['prediction'] = (r, is_correct,)
         mini_batches['cur_max_new_tokens'] = cur_max_new_tokens
+
+        # self.replay_buffer.add(mini_batches)
         return mini_batches
 
     @staticmethod
