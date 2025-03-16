@@ -10,8 +10,8 @@ from string import punctuation
 import re
 
 import nltk
-nltk.download('punkt')
-nltk.download('punkt_tab')
+# nltk.download('punkt')
+# nltk.download('punkt_tab')
 from nltk.tokenize import sent_tokenize
 
 import deepspeed
@@ -80,7 +80,7 @@ class StepLMConfig(SearchConfig):
         self.negative_gen = args.negative_gen
         
         self.ref_policy_model = args.ref_policy_model
-        self.ref_policy_model2 = args.ref_policy_model2
+        # self.ref_policy_model2 = args.ref_policy_model2
         
         self.base_tokenizer = args.base_tokenizer
         self.generation_config = args.generation_config        
@@ -386,7 +386,7 @@ class StepLMConfig(SearchConfig):
             log_probs = self._gather_log_probabilities(logits[input_ids.size(-1)-1:-1, :], gen_ids.to(logits.device)) # input_ids.size(-1) -1: -1 input id's last token for predicting the next token and -1 since the prediction of the last token is not needed 
             embs = hidden_states[input_ids.size(-1):]
             # if add_kl:
-            ref_logits, _ = self._get_logits(seq_input_ids, attention_mask=seq_attention_mask, model=self.ref_policy_model2.module)
+            ref_logits, _ = self._get_logits(seq_input_ids, attention_mask=seq_attention_mask, model=self.ref_policy_model.module)
             ref_log_probs = self._gather_log_probabilities(ref_logits[input_ids.size(-1)-1:-1, :], gen_ids.to(ref_logits.device))
             # else:
             #     ref_log_probs = None

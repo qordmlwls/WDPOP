@@ -141,14 +141,15 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
             trust_remote_code=self.args.trust_remote_code,
             hf_token=self.args.hf_token,
         )
-        self.actor_reference_model2, _ = load_pretrained_models(
-            self.args.actor_ref_model_name_or_path,
-            model_max_length=self.args.max_length,
-            padding_side='left',
-            auto_model_type=AutoModelForCausalLM,
-            trust_remote_code=self.args.trust_remote_code,
-            hf_token=self.args.hf_token,
-        )
+        # self.actor_reference_model2, _ = load_pretrained_models(
+        #     self.args.actor_ref_model_name_or_path,
+        #     model_max_length=self.args.max_length,
+        #     padding_side='left',
+        #     auto_model_type=AutoModelForCausalLM,
+        #     trust_remote_code=self.args.trust_remote_code,
+        #     hf_token=self.args.hf_token,
+        # )
+        self.actor_reference_model2 = None
         
         self.use_reward_model = False
         if self.args.reward_model_name_or_path:
@@ -332,11 +333,11 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
         )
         self.actor_reference_model.eval()
         
-        self.actor_reference_model2 = self._init_eval_engine(
-            model=self.actor_reference_model2,
-            ds_config=self.ds_eval_config,
-        )        
-        self.actor_reference_model2.eval()
+        # self.actor_reference_model2 = self._init_eval_engine(
+        #     model=self.actor_reference_model2,
+        #     ds_config=self.ds_eval_config,
+        # )        
+        # self.actor_reference_model2.eval()
         if self.use_reward_model:
             self.reward_model = self._init_eval_engine(
                 model=self.reward_model,
@@ -502,15 +503,15 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
                                                to_filter=self.args.filter,
                                                mcts_train_type=self.args.mcts_train_type):
                             continue
-                        
-                        self.replay_buffer.add(rl_batch)
+                        if self.args.use_replay_buffer:
+                            self.replay_buffer.add(rl_batch)
 
-                        if len(self.replay_buffer) >= self.args.rl_batch_size:
-                            sampled_batches = self.replay_buffer.sample(self.args.rl_batch_size)
-                        else:
-                            continue
-                        
-                        rl_batch = self.merge_rl_batches(sampled_batches)
+                            if len(self.replay_buffer) >= self.args.rl_batch_size:
+                                sampled_batches = self.replay_buffer.sample(self.args.rl_batch_size)
+                            else:
+                                continue
+                            
+                            rl_batch = self.merge_rl_batches(sampled_batches)
 
                         rl_info = self.tsrl_step(**rl_batch, num_step=num_step)
                         num_step += 1

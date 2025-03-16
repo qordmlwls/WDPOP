@@ -113,6 +113,12 @@ def parse_arguments() -> argparse.Namespace:
         default=500,
         help='The capacity of the replay buffer.',
     )
+    dataset_parser.add_argument(
+        '--use_replay_buffer',
+        type=str2bool,
+        default=True,
+        help='Whether to use the replay buffer.',
+    )
 
     # Training
     training_parser = parser.add_argument_group('training')

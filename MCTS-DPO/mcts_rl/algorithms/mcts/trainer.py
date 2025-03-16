@@ -667,7 +667,7 @@ class MCTSWDPOPTrainer(TSRLTrainer):
                 else:
                     is_correct = math_equal(extract_answer(prediction), extract_answer(f'{solution[0]}\nThe answer is {solution[1]}'))
         
-        mini_batches['prediction'] = (r, is_correct,)
+        mini_batches['prediction'] = [r, is_correct]
         mini_batches['cur_max_new_tokens'] = cur_max_new_tokens
 
         # self.replay_buffer.add(mini_batches)
@@ -693,10 +693,11 @@ class MCTSWDPOPTrainer(TSRLTrainer):
                 processed.append(tensor)
         if max_len <= 0:
             max_len = max(tensor.size(-1) for tensor in processed)
-        padded_tensors = []
+        padded_tensors, pad_len_list = [], []
         for tensor in processed:
             cur_len = tensor.size(-1)
             pad_len = max_len - cur_len
+            pad_len_list.append(pad_len)
             if pad_len > 0:
                 pad_shape = list(tensor.shape)
                 pad_shape[-1] = pad_len
@@ -705,7 +706,7 @@ class MCTSWDPOPTrainer(TSRLTrainer):
             else:
                 padded_tensor = tensor
             padded_tensors.append(padded_tensor)
-        return torch.stack(padded_tensors, dim=0)
+        return torch.stack(padded_tensors, dim=0), pad_len_list
     def tsrl_step(
         self,
         # Winner tensors: each is a Tensor (e.g., [1, seq_len]) or list of per-step Tensors.
@@ -744,7 +745,7 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         Note: Using the same model for policy and reference will yield diff = 0.
         """
         device = winner_input_ids_list[0].device if winner_input_ids_list else "cpu"
-
+        
         # -----------------------------------
         # Combine and pad winner and loser sequences.
         # -----------------------------------
@@ -757,9 +758,9 @@ class MCTSWDPOPTrainer(TSRLTrainer):
             return {}
 
         # Concatenate winner and loser lists.
-        combined_input_ids = self.pad_tensors(all_winner_input_ids + all_loser_input_ids,
+        combined_input_ids, input_id_pad_len_list = self.pad_tensors(all_winner_input_ids + all_loser_input_ids,
                                         pad_value=self.tokenizer.pad_token_id)
-        combined_attention_mask = self.pad_tensors(all_winner_attention_mask + all_loser_attention_mask,
+        combined_attention_mask, attention_mask_pad_len_list = self.pad_tensors(all_winner_attention_mask + all_loser_attention_mask,
                                             pad_value=False)
 
         # Determine the number of winner sequences.
@@ -770,7 +771,8 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         loser_input_ids_batch = combined_input_ids[n_winner:]
         winner_attention_mask_batch = combined_attention_mask[:n_winner]
         loser_attention_mask_batch = combined_attention_mask[n_winner:]
-
+        winner_input_id_pad_len_list = input_id_pad_len_list[:n_winner]
+        loser_input_id_pad_len_list = input_id_pad_len_list[n_winner:]
         # -----------------------------------
         # Actor model forward pass: process both batches at once.
         # -----------------------------------
@@ -798,43 +800,49 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         # -----------------------------------
         # Reference model forward passes (separate).
         # -----------------------------------
-        with torch.no_grad():
-            torch.cuda.empty_cache()
-            ref_winner_log_probs_batch = self.compute_log_probs(
-                self.actor_reference_model.module,
-                input_ids=winner_input_ids_batch,
-                attention_mask=winner_attention_mask_batch,
-            )
-            torch.cuda.empty_cache()
-            ref_loser_log_probs_batch = self.compute_log_probs(
-                self.actor_reference_model.module,
-                input_ids=loser_input_ids_batch,
-                attention_mask=loser_attention_mask_batch,
-            )
+        # with torch.no_grad():
+        #     torch.cuda.empty_cache()
+        #     ref_winner_log_probs_batch = self.compute_log_probs(
+        #         self.actor_reference_model.module,
+        #         input_ids=winner_input_ids_batch,
+        #         attention_mask=winner_attention_mask_batch,
+        #     )
+        #     torch.cuda.empty_cache()
+        #     ref_loser_log_probs_batch = self.compute_log_probs(
+        #         self.actor_reference_model.module,
+        #         input_ids=loser_input_ids_batch,
+        #         attention_mask=loser_attention_mask_batch,
+        #     )
 
         # -----------------------------------
         # Accumulate WDPOP loss per sample.
         # -----------------------------------
         losses = []
         hinge_terms = []
-        for i in range(len(winner_input_ids_list)):
+        for i in range(self.args.rl_batch_size):
             # Determine actual lengths (excluding padding) minus one token.
-            w_len = int(winner_attention_mask_list[i].sum().item()) - 1
-            l_len = int(loser_attention_mask_list[i].sum().item()) - 1
-
+            # w_len = int(winner_attention_mask_list[i].sum().item()) - 1
+            # l_len = int(loser_attention_mask_list[i].sum().item()) - 1
+            prompt_len = len(prompts_list[i])
+            w_pad_len = winner_input_id_pad_len_list[i]
+            l_pad_len = loser_input_id_pad_len_list[i]
             # Slice the log-probabilities.
-            w_log_probs = winner_log_probs_batch[i][:w_len]
-            l_log_probs = loser_log_probs_batch[i][:l_len]
-            ref_w_log_probs = ref_winner_log_probs_batch[i][:w_len]
-            ref_l_log_probs = ref_loser_log_probs_batch[i][:l_len]
+            w_log_probs = winner_log_probs_batch[i][prompt_len - 1: -w_pad_len]
+            l_log_probs = loser_log_probs_batch[i][prompt_len - 1: -l_pad_len]
+
+            # w_log_probs = winner_log_probs_batch[i][:w_len]
+            # l_log_probs = loser_log_probs_batch[i][:l_len]
+            # ref_w_log_probs = ref_winner_log_probs_batch[i][:w_len]
+            # ref_l_log_probs = ref_loser_log_probs_batch[i][:l_len]
 
             # Compute the overall log-ratio difference.
-            sum_winner_ratio = beta * (w_log_probs.sum() - ref_w_log_probs.sum())
-            sum_loser_ratio  = beta * (l_log_probs.sum() - ref_l_log_probs.sum())
+            sum_winner_ratio = beta * (w_log_probs.sum() - sum(winner_ref_probs[i]))
+            sum_loser_ratio  = beta * (l_log_probs.sum() - sum(loser_ref_probs[i]))
+            # sum_loser_ratio  = beta * (l_log_probs.sum() - ref_l_log_probs.sum())
 
 
-            sum_winner_ratio = beta * w_log_probs.sum() 
-            sum_loser_ratio  = beta * l_log_probs.sum() 
+            # sum_winner_ratio = beta * w_log_probs.sum() 
+            # sum_loser_ratio  = beta * l_log_probs.sum() 
             # if num_step == 0:
             #     sum_winner_ratio = beta * w_log_probs.sum()
             #     sum_loser_ratio  = beta * l_log_probs.sum()
@@ -845,11 +853,13 @@ class MCTSWDPOPTrainer(TSRLTrainer):
             step_hinge = 0.0
             step_actions = winner_step_actions_list[i]  # List of per-step Tensors.
             step_weights = winner_w_list[i]             # List of corresponding weights.
-            running_idx = 0
-            for actions_t, w_t in zip(step_actions, step_weights):
+            running_idx = prompt_len
+            for actions_t, w_t, step_log_ref in zip(step_actions, step_weights, winner_ref_probs[i]):
                 step_len = actions_t.size(-1)
+                if running_idx == prompt_len:
+                    step_len = actions_t.size(-1) - prompt_len
                 step_log_theta = w_log_probs[running_idx: running_idx + step_len].sum()
-                step_log_ref   = ref_w_log_probs[running_idx: running_idx + step_len].sum()
+                # step_log_ref   = ref_w_log_probs[running_idx: running_idx + step_len].sum()
                 running_idx += step_len
                 # Hinge: beta * w_t * max(0, (log π_ref - log π_θ))
                 step_hinge += beta * w_t * torch.clamp(step_log_ref - step_log_theta, min=0.0)
@@ -868,6 +878,7 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         loss = torch.stack(losses).mean()
         # torch.cuda.empty_cache()
         # Backward pass and optimizer step.
+        torch.cuda.empty_cache()
         self.actor_model.backward(loss)
         self.actor_model.step()
         total_grad_norm = 0.0
@@ -879,12 +890,12 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         print("Grad norm:", total_grad_norm**0.5)
         # Gather statistics.
         loss_val = get_all_reduce_mean(loss).item()
-        hinge_val = get_all_reduce_mean(torch.tensor(hinge_terms, device=device)).item()
-        r, is_correct = prediction
+        # hinge_val = get_all_reduce_mean(torch.tensor(hinge_terms, device=device)).item()
+        r, is_correct = tuple(prediction[0:2])
 
         return {
             "train/loss": loss_val,
-            "train/hinge": hinge_val,
+            # "train/hinge": hinge_val,
             "train/r_scores": float(r),
             "train/correct": float(is_correct),
             "train/n_sample": len(winner_input_ids_list),
