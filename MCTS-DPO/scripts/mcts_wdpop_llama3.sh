@@ -70,7 +70,7 @@ deepspeed --include "${INCLUDE_HOST}" --master_port "${MASTER_PORT}" \
     --per_device_ptx_batch_size 4 \
     --per_device_prompt_batch_size 1 \
     --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 64 \
+    --gradient_accumulation_steps 1 \
     --actor_lr 1e-6 \
     --actor_weight_decay 0.05 \
     --actor_lr_scheduler_type cosine \

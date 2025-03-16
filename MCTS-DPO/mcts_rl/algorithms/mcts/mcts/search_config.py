@@ -109,8 +109,8 @@ class StepLMConfig(SearchConfig):
         self.verbose = args.verbose
 
     def _gather_log_probabilities(self, logits: torch.Tensor, labels: torch.LongTensor) -> torch.Tensor:
-        """Gather log probabilities of the given labels from the logits."""
-        log_probs = F.log_softmax(logits.float(), dim=-1)
+        """Gather log probabilities of the given labels from the logits. (ground truth's log probability)"""
+        log_probs = F.log_softmax(logits.float(), dim=-1) 
         log_probs_labels = log_probs.gather(dim=-1, index=labels.unsqueeze(dim=-1))
         return log_probs_labels.squeeze(dim=-1)
     
@@ -179,6 +179,7 @@ class StepLMConfig(SearchConfig):
             current_step = 0
         next_step = current_step + 1
         next2_step = next_step + 1
+        stop_string = f'## Step {next2_step}:'
         # Markers for searching in the new generation
         next_step_marker_pattern  = rf'(?:##\s*)?(?:[Ss][Tt][Ee][Pp])\s*{next_step}\s*:\s*'
         next2_step_marker_pattern = rf'(?:##\s*)?(?:[Ss][Tt][Ee][Pp])\s*{next2_step}\s*:\s*'
@@ -204,6 +205,9 @@ class StepLMConfig(SearchConfig):
                     do_sample=True,
                     eos_token_id=terminators,
                     synced_gpus=True,
+                    # stopping strings
+                    stop_strings=[stop_string],
+                    tokenizer=self.base_tokenizer,
                 )
             else:
                 cur_max_new_tokens = (self.generation_config.max_length - input_ids.size(-1)) if n_actions == 1 else cur_max_new_tokens
@@ -379,7 +383,7 @@ class StepLMConfig(SearchConfig):
                 seq_input_ids.not_equal(self.base_tokenizer.unk_token_id),
             )
             logits, hidden_states = self._get_logits(seq_input_ids, attention_mask=seq_attention_mask, model=policy_model.module)
-            log_probs = self._gather_log_probabilities(logits[input_ids.size(-1)-1:-1, :], gen_ids.to(logits.device))
+            log_probs = self._gather_log_probabilities(logits[input_ids.size(-1)-1:-1, :], gen_ids.to(logits.device)) # input_ids.size(-1) -1: -1 input id's last token for predicting the next token and -1 since the prediction of the last token is not needed 
             embs = hidden_states[input_ids.size(-1):]
             # if add_kl:
             ref_logits, _ = self._get_logits(seq_input_ids, attention_mask=seq_attention_mask, model=self.ref_policy_model2.module)
