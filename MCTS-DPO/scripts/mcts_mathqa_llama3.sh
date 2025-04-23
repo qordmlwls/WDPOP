@@ -50,9 +50,9 @@ DEEPSPEED_ARGS+=("--master_port" "${MASTER_PORT}")
 
 exec 1> >(tee "${OUTPUT_DIR}/stdout.log" >&1) 2> >(tee "${OUTPUT_DIR}/stderr.log" >&2)
 
-gpu_vis=$1
+# gpu_vis=$1
 
-deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
+deepspeed --include localhost:0,1 --master_port $MASTER_PORT \
 	--module mcts_rl.algorithms.mcts \
 	--train_datasets MathQA/train \
 	--model_type llama3 \

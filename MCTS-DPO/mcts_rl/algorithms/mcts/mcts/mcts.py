@@ -44,6 +44,7 @@ class MCTSConfig(NamedTuple):
     add_kl: bool = False
     consider_diversity: bool = True
     length_penalty: float = 1.25
+    max_min_multiplier: float = 1.0
     
 
 class MCTSNode(Generic[State, Action]):
@@ -70,6 +71,7 @@ class MCTSNode(Generic[State, Action]):
         length_penalty: float = 1.25,
         max_reward: float = 0.0,
         min_reward: float = 0.0,
+        max_min_multiplier: float = 1.0,
     ):
         """
         A node in the MCTS search tree
@@ -105,6 +107,7 @@ class MCTSNode(Generic[State, Action]):
         self.prompt = prompt
         self.max_reward = max_reward
         self.min_reward = min_reward
+        self.max_min_multiplier = max_min_multiplier
         
         self.N = 0
         self.V = 0.0
@@ -117,11 +120,12 @@ class MCTSNode(Generic[State, Action]):
         # TODO: consider KL divergence in MCTS
         elif self.rewards == 'WDPOP' and not self.is_terminal:
             return (self.log_probs.sum() - self.ref_log_probs.sum()).detach().item()
+            # return 0.0
         elif self.is_terminal:
             if self.is_correct:
-                return self.max_reward if self.max_reward > 1.0 else 1.0
+                return self.max_min_multiplier * self.max_reward if self.max_reward > 1.0 else 1.0 * self.max_min_multiplier
             else:
-                return self.min_reward if self.min_reward < -1.0 else -1.0
+                return self.max_min_multiplier * self.min_reward if self.min_reward < -1.0 else -1.0 * self.max_min_multiplier
         # return self.rewards.mean().detach().item() + (self.value if self.parent is None else (self.value - self.parent.value))
         raise ValueError('Should not consider kl divergence here!')
     
@@ -268,17 +272,19 @@ class MCTS(SearchAlgorithm, Generic[State, Action]):
             return
         
         actions = self.search_config.get_actions(self.policy_model, node.state, add_kl=self.add_kl)
-        
+        print('### get_actions ###')
         action_batch, log_probs_batch, ref_log_probs_batch = [], [], []
         for action, _, (log_probs, ref_log_probs), _ in actions:
             action_batch.append(action)
             # text_batch.append(text)
             log_probs_batch.append(log_probs)
             ref_log_probs_batch.append(ref_log_probs)
+        print('### get_values ###') 
         reward_value_batch = self.search_config.get_values(self.policy_model, node.state, action_batch, 
                                                            log_probs_batch, ref_log_probs_batch, 
                                                            add_kl=self.add_kl, parent_depth=node.depth,
                                                            parent_value=node.value)
+        print('### get_values end ###')
 
         children = []
         for (action, (prompt, text), (log_probs, ref_log_probs), embs), (value, base_rewards, is_terminal) in zip(actions, reward_value_batch):
@@ -383,6 +389,7 @@ class MCTSWDPOP(SearchAlgorithm, Generic[State, Action]):
         self.disable_tqdm = args.disable_tqdm
         self.consider_diversity = args.consider_diversity
         self.length_penalty = args.length_penalty
+        self.max_min_multiplier = args.max_min_multiplier
         
         self.policy_model = None
         self.max_reward = 0.0
@@ -440,11 +447,19 @@ class MCTSWDPOP(SearchAlgorithm, Generic[State, Action]):
             return probs, selected_idx, next_action_V, next_action_Q
         return probs, next_action_V, next_action_Q
     
-    def iterate(self, node: MCTSNode, policy_model=None) -> list[MCTSNode]:
+    def iterate(self, node: MCTSNode, policy_model=None, additional_tree_search=False) -> list[MCTSNode] | str:
         node.N += 1
         path = self._select(node)
+        no_valid_actions_count = 0
         while not self._is_terminal_with_depth_limit(path[-1]):
-            self._expand_and_evaluate(path[-1], self.max_reward, self.min_reward, policy_model=policy_model)
+            flag = self._expand_and_evaluate(path[-1], self.max_reward, self.min_reward, policy_model=policy_model)
+            if no_valid_actions_count > 10:
+                return 'No valid actions'            
+            if flag == 'No valid actions':
+                print('No valid actions')
+                no_valid_actions_count += 1
+                continue
+
             # ### debug mode
             # if path[-1].parent is not None:
             #     self._back_propagate(path)
@@ -452,27 +467,90 @@ class MCTSWDPOP(SearchAlgorithm, Generic[State, Action]):
                 break
             node = self._puct_select(path[-1])
             path.append(node)
-            if self.max_reward < node.r:
-                self.max_reward = node.r
-                
-            if self.min_reward > node.r:    
-                self.min_reward = node.r
-                
-            if self.max_q < node.Q:
-                self.max_q = node.Q
-            if self.min_q > node.Q:
-                self.min_q = node.Q
-        if self.max_reward < node.r:
-            self.max_reward = node.r
+            if not additional_tree_search:
+                if self.max_reward < node.r:
+                    self.max_reward = node.r
+                    
+                if self.min_reward > node.r:    
+                    self.min_reward = node.r
+                    
+                if self.max_q < node.Q:
+                    self.max_q = node.Q
+                if self.min_q > node.Q:
+                    self.min_q = node.Q
+                # if not (node.log_probs is None):
+                #     if node.is_terminal:
+                #         node_r = node.r
+                #     else:
+                #         node_r = (node.log_probs.sum() - node.ref_log_probs.sum()).detach().item()
+                #     if self.max_reward < node_r:
+                #         self.max_reward = node_r
+                        
+                #     if self.min_reward > node_r:    
+                #         self.min_reward = node_r
+                        
+                #     if self.max_q < node.Q:
+                #         self.max_q = node.Q
+                #     if self.min_q > node.Q:
+                #         self.min_q = node.Q 
+        
+        if not additional_tree_search:
+            self._back_propagate(path)
+            for node in path:
+                if self.max_reward < node.r:
+                    self.max_reward = node.r
+                    
+                if self.min_reward > node.r:    
+                    self.min_reward = node.r
+                    
+                if self.max_q < node.Q:
+                    self.max_q = node.Q
+                if self.min_q > node.Q:
+                    self.min_q = node.Q
+                # if not (node.log_probs is None):
+                #     if node.is_terminal:
+                #         node_r = node.r
+                #     else:
+                #         node_r = (node.log_probs.sum() - node.ref_log_probs.sum()).detach().item()
+                #     if self.max_reward < node_r:
+                #         self.max_reward = node_r
+                        
+                #     if self.min_reward > node_r:    
+                #         self.min_reward = node_r
+                        
+                #     if self.max_q < node.Q:
+                #         self.max_q = node.Q
+                #     if self.min_q > node.Q:
+                #         self.min_q = node.Q
             
-        if self.min_reward > node.r:    
-            self.min_reward = node.r
-            
-        if self.max_q < node.Q:
-            self.max_q = node.Q
-        if self.min_q > node.Q:
-            self.min_q = node.Q
-        self._back_propagate(path)
+        return path
+    
+    def additional_iterate(self, node: MCTSNode, policy_model=None) -> list[MCTSNode] | str:
+        node.N += 1
+        path = []
+        path.append(node)
+        is_terminal_flag = False
+        for idx, step in enumerate(self.search_config.example['step_solution']):
+            if idx == len(self.search_config.example['step_solution']) - 1:
+                is_terminal_flag = True
+            self._addtional_expand_and_evaluate(path[-1], step, is_terminal_flag, self.max_reward, self.min_reward, policy_model=policy_model)
+            if path[-1].children is None:
+                continue
+            else:
+                path.append(path[-1].children[-1])
+
+        # self._back_propagate(path)
+        # for node in path:
+        #     if self.max_reward < node.r:
+        #         self.max_reward = node.r
+                
+        #     if self.min_reward > node.r:    
+        #         self.min_reward = node.r
+                
+        #     if self.max_q < node.Q:
+        #         self.max_q = node.Q
+        #     if self.min_q > node.Q:
+        #         self.min_q = node.Q
         return path
 
     def _is_terminal_with_depth_limit(self, node: MCTSNode):
@@ -492,8 +570,34 @@ class MCTSWDPOP(SearchAlgorithm, Generic[State, Action]):
     def _puct_select(self, node: MCTSNode) -> MCTSNode:
         xnode = max(node.children, key=self._puct)
         return xnode
+    
+    def _addtional_expand_and_evaluate(self, node: MCTSNode, step: str, is_terminal_flag, max_reward=0.0, min_reward=0.0, policy_model=None) -> None | str:
+        if node.state is None:
+            node.state = self.world_model.step(node.parent.state, node.action, node.log_probs)
+            node.is_terminal = self.world_model.is_terminal(node.state)
+        
+        if node.is_terminal:
+            return
+        
+        (action, (prompt, text), (log_probs, ref_log_probs), embs) = self.search_config.get_additional_actions(policy_model, node.state, is_terminal_flag, step)
+        is_terminal = text.endswith(self.search_config.base_tokenizer.eos_token) or text.endswith('<|eot_id|>')
+        is_correct = False
+        if is_terminal:
+            is_correct = True
+        children = []
+        child = MCTSNode(state=None, action=action, parent=node, 
+                            base_rewards='WDPOP',  
+                            embeddings=embs, log_probs=log_probs, ref_log_probs=ref_log_probs,
+                            text=text, prompt=prompt, is_terminal=is_terminal, is_correct=is_correct, 
+                            length_penalty=self.length_penalty, max_reward=max_reward, min_reward=min_reward,
+                            max_min_multiplier=self.max_min_multiplier)
+        
+        child.Q = self.max_q
+        children.append(child)
+        node.children = children if node.children is None else node.children + children
+        
 
-    def _expand_and_evaluate(self, node: MCTSNode, max_reward=0.0, min_reward=0.0, policy_model=None):
+    def _expand_and_evaluate(self, node: MCTSNode, max_reward=0.0, min_reward=0.0, policy_model=None) -> None | str:
         if node.state is None:
             node.state = self.world_model.step(node.parent.state, node.action, node.log_probs)
             node.is_terminal = self.world_model.is_terminal(node.state)
@@ -517,6 +621,9 @@ class MCTSWDPOP(SearchAlgorithm, Generic[State, Action]):
         children = []
         for (action, (prompt, text), (log_probs, ref_log_probs), embs) in actions:
             is_terminal = text.endswith(self.search_config.base_tokenizer.eos_token) or text.endswith('<|eot_id|>')
+            if ("Step" not in text) and (not is_terminal):
+                continue
+    
             is_correct = False
             if is_terminal:
                 solution = (self.search_config.example['reasoning'], self.search_config.example['answer'])
@@ -535,8 +642,11 @@ class MCTSWDPOP(SearchAlgorithm, Generic[State, Action]):
                              base_rewards='WDPOP',  
                              embeddings=embs, log_probs=log_probs, ref_log_probs=ref_log_probs,
                              text=text, prompt=prompt, is_terminal=is_terminal, is_correct=is_correct, 
-                             length_penalty=self.length_penalty, max_reward=max_reward, min_reward=min_reward)
+                             length_penalty=self.length_penalty, max_reward=max_reward, min_reward=min_reward,
+                             max_min_multiplier=self.max_min_multiplier)
             children.append(child)
+        if len(children) == 0:
+            return 'No valid actions'
         node.children = children if node.children is None else node.children + children
 
     def _simulate(self, path: list[MCTSNode]):
@@ -554,13 +664,15 @@ class MCTSWDPOP(SearchAlgorithm, Generic[State, Action]):
         node = path[-1]
         node.Q = node.r + self.gamma * node.V
         node.N += 1
+        # node.Q = node.Q + 1 / node.N * (node.r - node.Q)
         for node in reversed(path[:-1]):
             node.V = sum(max(1, child.N) * child.Q for child in node.children) / sum(max(1, child.N) for child in node.children)
             node.N += 1
+            # node.Q = node.Q + 1 / node.N * (node.r - node.Q)
             if node.action is not None:
                 node.Q = node.r + self.gamma * node.V
 
-    def search(self, policy_model=None):
+    def search(self, policy_model=None, additional_tree_search=False) -> None | str:
         if self.root is None:
             self.root = MCTSNode(state=self.world_model.init_state(), action=None, parent=None, length_penalty=self.length_penalty)
         if self.output_trace_in_each_iter:
@@ -568,16 +680,24 @@ class MCTSWDPOP(SearchAlgorithm, Generic[State, Action]):
 
         n_iters = self.n_iters if self.root.depth else self.n_iters * 4     # iterate more at the starting point
         for _ in trange(n_iters, disable=self.disable_tqdm, desc='MCTS iteration', leave=False):
-            path = self.iterate(self.root, policy_model=policy_model)
+            if len(self.search_config.example.get('step_solution', [])) > 0 and self.root.depth == 0 and _ == 0:
+                path = self.additional_iterate(self.root, policy_model=policy_model)
+            else:
+                path = self.iterate(self.root, policy_model=policy_model, additional_tree_search=additional_tree_search)
+            if path == 'No valid actions':
+                return 'No valid actions'
             if self.output_trace_in_each_iter:
                 self.trace_in_each_iter.append(deepcopy(path))
+        
+        return None
 
     def __call__(self,
                  world_model: WorldModel[State, Action, Example],
                  search_config: SearchConfig[State, Action, Example],
                  root_node: Optional[Union[MCTSNode, int]] = None,
                  policy_model = None,
-                 **kwargs) -> MCTSResult:
+                 additional_tree_search: bool = False,
+                 **kwargs) -> MCTSResult | str:
         if root_node is None:
             MCTSNode.reset_id()
             
@@ -586,8 +706,9 @@ class MCTSWDPOP(SearchAlgorithm, Generic[State, Action]):
         self.search_config = search_config
         self.consider_diversity = False if self.search_config.n_actions == 1 else self.consider_diversity
 
-        self.search(policy_model=policy_model)
-        
+        result = self.search(policy_model=policy_model, additional_tree_search=additional_tree_search)
+        if result == 'No valid actions':
+            return 'No valid actions'
         if self.output_trace_in_each_iter:
             trace_in_each_iter = self.trace_in_each_iter
         else:

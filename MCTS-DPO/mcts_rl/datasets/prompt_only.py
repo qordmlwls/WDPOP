@@ -54,12 +54,19 @@ class PromptOnlyDataset(TokenizedDataset):
         except:
             import ipdb; ipdb.set_trace()
         input_ids = self.tokenize(prompt)
+        step_solution_ids = []
+        if raw_sample.get('step_solution', None) is not None:
+            for step in raw_sample['step_solution']:
+                step_solution_ids.append(self.tokenize(step))
+            # step_solution_ids = [self.tokenize(step) for step in raw_sample['step_solution']]
         return {
             'input_ids': input_ids,  # size = (L,)
             'answer': raw_sample.get('final_answer', ''),     # str
             # 'instructions': raw_sample.get('instructions', ''),
             'reasoning': raw_sample.get('answer', ''),
-            'answer_content': raw_sample.get('final_answer_content', raw_sample['final_answer'] if 'final_answer' in raw_sample else '')
+            'answer_content': raw_sample.get('final_answer_content', raw_sample['final_answer'] if 'final_answer' in raw_sample else ''),
+            'step_solution': raw_sample.get('step_solution', []),
+            'step_solution_ids': step_solution_ids
         }
 
     def get_collator(self) -> Callable[[list[dict[str, torch.Tensor]]], dict[str, torch.Tensor]]:
@@ -92,6 +99,7 @@ class PromptOnlyCollator(CollatorBase):
             'answer': [sample['answer'] for sample in samples], 
             'reasoning': [sample['reasoning'] for sample in samples], 
             'answer_content': [sample['answer_content'] for sample in samples], 
+            'step_solution': [sample['step_solution'] for sample in samples][0],
         }
 
 

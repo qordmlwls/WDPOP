@@ -110,6 +110,7 @@ class RawSample(TypedDict, total=False):
     """Other assistant answer text via resampling."""
     dialogue: NotRequired[list[str]]  # either `input` or `dialogue` should be provided
     """Dialogue history."""
+    step_solution: NotRequired[list[str]]
     
     final_answer: NotRequired[str | None]
     final_answer_content: NotRequired[str | None]

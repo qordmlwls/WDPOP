@@ -119,6 +119,24 @@ def parse_arguments() -> argparse.Namespace:
         default=True,
         help='Whether to use the replay buffer.',
     )
+    dataset_parser.add_argument(
+        "--checkpoint_step_num",
+        type=int,
+        default=0,
+        help="The last step number when the checkpoint is saved.",
+    )
+    dataset_parser.add_argument(
+        "--shuffle_prompt_dataloader",
+        type=str2bool,
+        default=True,
+        help="Whether to shuffle the prompt dataloader.",
+    )   
+    dataset_parser.add_argument(
+        "--load_replay_buffer",
+        type=str2bool,
+        default=False,
+        help="Whether to load the replay buffer.",
+    )
 
     # Training
     training_parser = parser.add_argument_group('training')
@@ -351,6 +369,11 @@ def parse_arguments() -> argparse.Namespace:
         type=int,
         default=4,
     )
+    training_parser.add_argument(
+        '--delayed_update_interval',
+        type=int,
+        default=4,
+    )
 
     # Generation Config
     generation_parser = parser.add_argument_group('generation')
@@ -475,6 +498,12 @@ def parse_arguments() -> argparse.Namespace:
         default='dpo',
         choices=['dpo', 'wdpop'],
     )
+    mcts_parser.add_argument(
+        '--max_min_multiplier',
+        type=float,
+        default=1.0,
+        help="The multiplier for MCTSNode max-min value.",
+    )
 
     # Evaluation
     evaluation_parser = parser.add_argument_group('evaluation')
@@ -508,7 +537,26 @@ def parse_arguments() -> argparse.Namespace:
         default=False,
         action='store_true',
     )
-
+    # vllm
+    vllm_parser = parser.add_argument_group('vllm')
+    vllm_parser.add_argument(
+        '--vllm_server_host',
+        type=str,  
+        default='0.0.0.0',
+        help='The host of the VLLM server.',
+    )
+    vllm_parser.add_argument(
+        '--vllm_server_port',
+        type=int,
+        default=8000,
+        help='The port of the VLLM server.',
+    )
+    vllm_parser.add_argument(
+        '--vllm_server_timeout',
+        type=float,
+        default=120.0,
+        help='The timeout of the VLLM server.',
+    )
     # Logging
     logging_parser = parser.add_argument_group('logging')
     logging_parser.add_argument(
@@ -559,6 +607,11 @@ def parse_arguments() -> argparse.Namespace:
         default=1000000,
         help='The interval to save the model.',
     )
+    logging_parser.add_argument(
+        '--max_len_wrong_answer',
+        type=int,
+        default=50,
+    )
 
     # DeepSpeed
     deepspeed_parser = parser.add_argument_group('deepspeed')
@@ -603,7 +656,8 @@ def parse_arguments() -> argparse.Namespace:
 def main() -> None:
     """Main training routine."""
     args = parse_arguments()
-
+    # import os
+    # os.environ["LOCAL_RANK"] = "0"
     deepspeed.init_distributed()
 
     args.global_rank = dist.get_rank()

@@ -44,8 +44,14 @@ from mcts_rl.utils import (
     is_main_process,
     to_device,
     check_available,
+    math_equal,
+    extract_answer,
+    csr_equal,
 )
 from mcts_rl.replay_buffer import ReplayBuffer
+from vllm import LLM
+from trl.extras.vllm_client import VLLMClient
+from collections import deque
 
 
 class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
@@ -76,13 +82,27 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
         self.ds_train_config = ds_train_config
         self.ds_eval_config = ds_eval_config
         self.global_step = 0
+        self.vllm_client = None
+        self.number_of_wrong_answers = 0
+        # self.number_of_wrong_answers_before_10_steps = 0
+        self.max_len = self.args.max_len_wrong_answer
+        self.store_number_of_wrong_answers = deque(maxlen=self.max_len)
+        self.delayed_update = 1
+        self.accumulate_gradients_count = 0
+        self.r_score = 0.0
+        self.min_q = 0.0
+        self.max_reward = 0.0
+        self.min_reward = 0.0
+        
 
+        
         self.init_models()
         dist.barrier()
         self.init_datasets()
         dist.barrier()
         self.init_engines()
         dist.barrier()
+        self.init_vllm_client()
         
         self.generation_config = GenerationConfig(
             max_length=self.args.max_length,
@@ -110,6 +130,9 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
         self.gae_lambda = 0.95
         self.scale_coeff = self.args.scale_coeff
         self.replay_buffer = ReplayBuffer(capacity=self.args.replay_buffer_capacity)
+        if self.args.load_replay_buffer:
+            self.replay_buffer.load()
+        self.ref_state_dict = None
 
     def init_models(self) -> None:
         """Initialize model and tokenizer."""
@@ -125,7 +148,16 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
         ):
             self.dsechf_eval = HfDeepSpeedConfig(self.ds_eval_config)
 
-        self.actor_model, self.tokenizer = load_pretrained_models(
+        # self.actor_model, self.tokenizer = load_pretrained_models(
+        #     self.args.actor_model_name_or_path,
+        #     model_max_length=self.args.max_length,
+        #     padding_side='left',
+        #     auto_model_type=AutoModelForCausalLM,
+        #     trust_remote_code=self.args.trust_remote_code,
+        #     hf_token=self.args.hf_token,
+        # )
+
+        self.actor_model, _ = load_pretrained_models(
             self.args.actor_model_name_or_path,
             model_max_length=self.args.max_length,
             padding_side='left',
@@ -133,7 +165,16 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
             trust_remote_code=self.args.trust_remote_code,
             hf_token=self.args.hf_token,
         )
-        self.actor_reference_model, _ = load_pretrained_models(
+        # self.actor_reference_model = None
+        # self.actor_reference_model, _ = load_pretrained_models(
+        #     self.args.actor_ref_model_name_or_path,
+        #     model_max_length=self.args.max_length,
+        #     padding_side='left',
+        #     auto_model_type=AutoModelForCausalLM,
+        #     trust_remote_code=self.args.trust_remote_code,
+        #     hf_token=self.args.hf_token,
+        # )
+        self.actor_reference_model, self.tokenizer  = load_pretrained_models(
             self.args.actor_ref_model_name_or_path,
             model_max_length=self.args.max_length,
             padding_side='left',
@@ -141,6 +182,36 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
             trust_remote_code=self.args.trust_remote_code,
             hf_token=self.args.hf_token,
         )
+        # params_list = list(self.actor_model.parameters())
+
+        # import copy
+        # with deepspeed.zero.GatheredParameters(params_list, modifier_rank=0):
+        #     if dist.get_rank() == 0:
+        #         # 3) Get the actor model's state dict. This includes both
+        #         #    learnable parameters and buffers (e.g. BatchNorm stats).
+        #         self.ref_state_dict = copy.deepcopy(self.actor_model.state_dict()) 
+
+        #         # 4) Copy the live Parameter data into the state_dict Tensors.
+        #         #    This ensures the state_dict has up-to-date weights in Tensor form.
+        #         for name, param in self.actor_model.named_parameters():
+        #             # Safely copy the param data into the existing Tensor in state_dict
+        #             # (rather than replacing actor_model_state_dict[name] with a Parameter)
+        #             if name in self.ref_state_dict:
+        #                 self.ref_state_dict[name].copy_(param.data)
+        self.ref_state_dict = None
+        
+        # self.ref_state_dict = copy.deepcopy(self.actor_model.state_dict()) 
+        # self.inference_model = LLM(self.args.actor_ref_model_name_or_path,
+        #                            trust_remote_code=self.args.trust_remote_code,
+        #                            )
+        # os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+        # device = torch.device('cuda:1')
+        # self.inference_model = LLM(model='/root/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6',
+        #                            trust_remote_code=self.args.trust_remote_code
+        #                            )
+        # os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+        
+        self.inference_model = None
         # self.actor_reference_model2, _ = load_pretrained_models(
         #     self.args.actor_ref_model_name_or_path,
         #     model_max_length=self.args.max_length,
@@ -166,6 +237,14 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
                 },
             )
             self.reward_model.set_normalize(self.args.normalize_reward)
+
+    def init_vllm_client(self) -> None:
+        """Initialize VLLM client."""
+        self.vllm_client = VLLMClient(
+            self.args.vllm_server_host,
+            self.args.vllm_server_port,
+            connection_timeout=self.args.vllm_server_timeout,
+        )
 
     def init_datasets(self) -> None:
         """Initialize training and evaluation datasets."""
@@ -223,7 +302,7 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
         self.prompt_only_dataloader = DataLoader(
             prompt_only_dataset,
             collate_fn=prompt_only_dataset.get_collator(),
-            sampler=DistributedSampler(prompt_only_dataset, shuffle=True),
+            sampler=DistributedSampler(prompt_only_dataset, shuffle=self.args.shuffle_prompt_dataloader),
             batch_size=self.args.per_device_prompt_batch_size,
         )
         
@@ -244,12 +323,13 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
             self.ptx_dataloader = DataLoader(DummyDataset(len(self.prompt_only_dataloader)))
 
         self.args.total_training_steps = int(
-            len(self.prompt_only_dataloader)
-            * self.args.epochs
+            (len(self.prompt_only_dataloader) )
+            * self.args.epochs 
             * self.args.update_iters
             * self.args.per_device_prompt_batch_size
             * self.args.num_return_sequences
-            // self.args.per_device_train_batch_size,
+            // self.args.per_device_train_batch_size
+            // self.args.delayed_update_interval -  self.args.checkpoint_step_num ,
         )
 
     def _init_train_engine(
@@ -311,11 +391,21 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
             actor_total_training_steps *= 2
         
         if self.args.need_eval:
-            self.actor_model = self._init_eval_engine(
+            # self.actor_model = self._init_eval_engine(
+            #     model=self.actor_model,
+            #     ds_config=self.ds_eval_config,
+            # )
+            # self.actor_model.eval()
+            self.actor_model = self._init_train_engine(
                 model=self.actor_model,
-                ds_config=self.ds_eval_config,
+                weight_decay=self.args.actor_weight_decay,
+                lr=self.args.actor_lr,
+                lr_scheduler_type=self.args.actor_lr_scheduler_type,
+                lr_warmup_ratio=self.args.actor_lr_warmup_ratio,
+                total_training_steps=actor_total_training_steps,
+                ds_config=actor_ds_config,
             )
-            self.actor_model.eval()
+            pass
         else:
             self.actor_model = self._init_train_engine(
                 model=self.actor_model,
@@ -327,17 +417,13 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
                 ds_config=actor_ds_config,
             )
 
+        # self.actor_reference_model = self.actor_model
         self.actor_reference_model = self._init_eval_engine(
             model=self.actor_reference_model,
             ds_config=self.ds_eval_config,
         )
         self.actor_reference_model.eval()
         
-        # self.actor_reference_model2 = self._init_eval_engine(
-        #     model=self.actor_reference_model2,
-        #     ds_config=self.ds_eval_config,
-        # )        
-        # self.actor_reference_model2.eval()
         if self.use_reward_model:
             self.reward_model = self._init_eval_engine(
                 model=self.reward_model,
@@ -365,14 +451,17 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
     def split_tsrl_micro_batches(
         self,
         prompt_only_batch: PromptOnlyBatch | PromptOnlyPostBatch,
-    ) -> list[PromptOnlyBatch | PromptOnlyPostBatch]:
+    ) -> list[PromptOnlyBatch | PromptOnlyPostBatch] | str:
         """Split a batch of RL samples into micro-batches."""
         total_batch_size = prompt_only_batch['input_ids'].size(0) if not self.args.post \
             else len(prompt_only_batch['prompts_list'])
         micro_batch_size = self.args.per_device_train_batch_size
         micro_batches = []
         assert total_batch_size == micro_batch_size
-        micro_batches.extend(self.tree_constructor(prompt_only_batch))
+        micro_batch = self.tree_constructor(prompt_only_batch)
+        if micro_batch == 'No valid actions':
+            return micro_batch
+        micro_batches.extend(micro_batch)
         return micro_batches
 
     def split_ptx_micro_batches(
@@ -470,6 +559,7 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
         num_ptx_batches = len(self.ptx_dataloader)
         num_ptx_replicas = (num_prompt_only_batches + num_ptx_batches - 1) // num_ptx_batches
         num_step = 0
+        checkpoint_step_num = 0
         for epoch in range(self.args.epochs):
             if epoch < epochs_trained: continue
             
@@ -477,6 +567,17 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
                 self.prompt_only_dataloader,
                 itertools.chain.from_iterable([self.ptx_dataloader] * num_ptx_replicas),
             ):
+                checkpoint_step_num += 1
+                print(f'step_num: {checkpoint_step_num}')
+                if checkpoint_step_num <= (self.args.checkpoint_step_num * self.args.delayed_update_interval):
+                    # progress_bar.set_description(
+                    #     f'Training {epoch + 1}/{self.args.epochs} epoch '
+                    # )
+                    # progress_bar.update(1 * self.args.update_iters)            
+                    continue
+                # temporarily
+                # if checkpoint_step_num < 15:
+                #     continue
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
                     continue
@@ -486,6 +587,13 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
                     self.set_eval()
                 prompt_only_batch = to_device(prompt_only_batch, self.args.device)
                 rl_batches = self.split_tsrl_micro_batches(prompt_only_batch)
+                if rl_batches == 'No valid actions':
+                    print('### skip this batch because no valid actions ###')
+                    # progress_bar.set_description(
+                    #     f'Training {epoch + 1}/{self.args.epochs} epoch '
+                    # )
+                    # progress_bar.update(1 * self.args.update_iters)  
+                    continue
                 if self.use_ptx:
                     ptx_batch = to_device(ptx_batch, self.args.device)
                     ptx_batches = self.split_ptx_micro_batches(ptx_batch)
@@ -502,21 +610,52 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
                                                max_tokens=self.args.max_length, 
                                                to_filter=self.args.filter,
                                                mcts_train_type=self.args.mcts_train_type):
+                            print('### skip this batch because answer is not correct ###')
+                            # progress_bar.set_description(
+                            #     f'Training {epoch + 1}/{self.args.epochs} epoch '
+                            # )
+                            # progress_bar.update(1)    
                             continue
+                        self.r_score = rl_batch['prediction'][0]
+                        self.min_q = rl_batch['prediction'][2]
+                        self.max_reward = rl_batch['prediction'][3]
+                        self.min_reward = rl_batch['prediction'][4]
                         if self.args.use_replay_buffer:
                             self.replay_buffer.add(rl_batch)
 
-                            if len(self.replay_buffer) >= self.args.rl_batch_size:
-                                sampled_batches = self.replay_buffer.sample(self.args.rl_batch_size)
+                            if len(self.replay_buffer) >= 2 * self.args.rl_batch_size:
+                                # sampled_batches = self.replay_buffer.sample(self.args.rl_batch_size)
+                                sampled_batches = self.replay_buffer.recemt_prioritized_sample(self.args.rl_batch_size, self.args.delayed_update_interval)
                             else:
+                                # progress_bar.set_description(
+                                #     f'Training {epoch + 1}/{self.args.epochs} epoch '
+                                # )
+                                # progress_bar.update(1)    
                                 continue
-                            
-                            rl_batch = self.merge_rl_batches(sampled_batches)
-
+                            input_ids_list = ''
+                            if 'input_ids_list' in rl_batch:
+                                input_ids_list = 'input_ids_list'
+                            elif 'winner_input_ids_list' in rl_batch:
+                                input_ids_list = 'winner_input_ids_list'                            
+                            device = rl_batch[input_ids_list][0].device if input_ids_list else 'cpu'
+                            rl_batch = self.merge_rl_batches(sampled_batches, device)
+                        self.delayed_update += 1
+                        if self.delayed_update % self.args.delayed_update_interval != 0:
+                            continue
                         rl_info = self.tsrl_step(**rl_batch, num_step=num_step)
+                        rl_info['train/total_steps'] = checkpoint_step_num
+                        rl_info['train/r_scores'] = self.r_score
+                        rl_info['train/min_q'] = self.min_q
+                        rl_info['train/max_reward'] = self.max_reward
+                        rl_info['train/min_reward'] = self.min_reward
                         num_step += 1
                         if rl_info is None or not len(rl_info): continue
                         torch.cuda.empty_cache()
+                        self.store_number_of_wrong_answers.append(self.number_of_wrong_answers)
+                        if len(self.store_number_of_wrong_answers) >= self.max_len:
+                            rl_info['train/number_of_wrong_answers_rolling_average'] = (self.number_of_wrong_answers - self.store_number_of_wrong_answers[0]) / self.max_len
+                        else:
+                            rl_info['train/number_of_wrong_answers_rolling_average'] = 0.0
                         self.logger.log(rl_info, step=self.global_step)
                         if self.use_ptx:
                             ptx_info = self.ptx_step(ptx_batch)
@@ -559,6 +698,8 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
                             )
                             self.save(global_steps=self.global_step)
                             self.logger.print('Checkpoint saved.')
+                            self.logger.print('Saving replay buffer ...')
+                            self.replay_buffer.save()
 
                         if (
                             self.args.need_eval
@@ -577,7 +718,7 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
                 self.save(global_steps=self.global_step)
                 self.logger.log(self.eval(), step=self.global_step)
 
-    def merge_rl_batches(self, rl_batches: list[dict[str, Any]]) -> dict[str, Any]:
+    def merge_rl_batches(self, rl_batches: list[dict[str, Any]], device) -> dict[str, Any]:
         """
         Merge a list of RL mini-batch dictionaries into a single dictionary.
         Each key in the dictionaries is aggregated in a single list or value.
@@ -592,6 +733,13 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
                     merged[key] = []
                 # If the field is already a list (e.g. prompts_list, input_ids_list, etc.), we extend
                 if isinstance(val, list):
+                    for elem in val:
+                        if isinstance(elem, torch.Tensor):
+                            elem = elem.to(device)
+                        elif isinstance(elem, list):
+                            for e in elem:
+                                if isinstance(e, torch.Tensor):
+                                    e = e.to(device)
                     merged[key].extend(val)
                 else:
                     # If it's a single item or scalar, just append
@@ -603,7 +751,7 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
         if self.eval_dataloader is None:
             return {}
 
-        self.set_eval()
+        # self.set_eval()
         prompts: list[str] = []
         generateds: list[str] = []
 
@@ -625,8 +773,11 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
                 correct_token_ids += [self.tokenizer.encode(tok)[-1] for tok in [' Correct']]
             correct_token_ids = list(set(correct_token_ids))
         
+        correct_number = 0
+        
         idx = -1
         for batch in eval_dataloader:
+            prompt = self.tokenizer.batch_decode(batch['input_ids'], skip_special_tokens=True)
             idx += 1
             if idx < count: continue
             if '/mj2/' in outputfile:
@@ -676,6 +827,22 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
                                 conf = sum(torch.exp(logprobs[tok_id]).detach().item() for tok_id in correct_token_ids)
                                 break
                     print(conf)
+            elif 'vllm' in outputfile:
+                cur_max_new_tokens = max(1, self.generation_config.max_length - batch['input_ids'].size(-1))
+                prompt = self.mcts_searcher.search_config.base_tokenizer.decode(batch['input_ids'][0], 
+                                        skip_special_tokens=self.mcts_searcher.search_config.model_type != 'llama3', 
+                                        clean_up_tokenization_spaces=False)
+                sequences = self.vllm_client.generate(
+                        prompts=[prompt],
+                        repetition_penalty=self.generation_config.repetition_penalty,
+                        temperature=0.6,
+                        top_p=0.9,
+                        max_tokens=cur_max_new_tokens,
+                        
+                    )
+                generated = [self.mcts_searcher.search_config.base_tokenizer.decode(torch.tensor(sequences[0]), 
+                                        skip_special_tokens=self.mcts_searcher.search_config.model_type != 'llama3', 
+                                        clean_up_tokenization_spaces=False)]
             else:
                 terminators = [self.tokenizer.eos_token_id]
                 terminators += [self.tokenizer.convert_tokens_to_ids("<|eot_id|>")] if self.args.model_type == 'llama3' else []
@@ -697,35 +864,51 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
 
             dist.barrier()
 
-            prompt = self.tokenizer.batch_decode(batch['input_ids'], skip_special_tokens=True)
-            init_values = None
-            if '/mcts/' in outputfile:
-                generated = [self.tokenizer.batch_decode(seq, skip_special_tokens=True) for seq in rl_batch['input_ids_list']]
-                init_values = [x for x in rl_batch['init_value_list']]
-            else:
-                generated = self.tokenizer.batch_decode(seq, skip_special_tokens=True)
-            if '/mcts/' in outputfile:
-                generated = [[text[len(prompt[0]) :] for text in text_list] for i, text_list in enumerate(generated)]
-            else:
-                generated = [text[len(prompt[0]) :] for text in generated]
             
-            prompts.extend(prompt)
+            solution = (batch['reasoning'][0], batch['answer'][0])
+            prediction = generated[0]
+            if self.mcts_searcher.search_config.use_code:
+                is_correct = math_equal(extract_answer(prediction, use_code=self.mcts_searcher.search_config.use_code), solution[1])
+            elif not solution[0].strip():
+                is_correct = csr_equal(prediction, ('(' + solution[1].strip() + ')', ''))
+            else:
+                is_correct = math_equal(extract_answer(prediction), extract_answer(f'{solution[0]}\nThe answer is {solution[1]}'))
+            if is_correct:
+                correct_number += 1
+            init_values = None
+            # if '/mcts/' in outputfile:
+            #     generated = [self.tokenizer.batch_decode(seq, skip_special_tokens=True) for seq in rl_batch['input_ids_list']]
+            #     init_values = [x for x in rl_batch['init_value_list']]
+            # else:
+            #     generated = self.tokenizer.batch_decode(seq, skip_special_tokens=True)
+            # if '/mcts/' in outputfile:
+            #     generated = [[text[len(prompt[0]) :] for text in text_list] for i, text_list in enumerate(generated)]
+            # else:
+            #     generated = [text[len(prompt[0]) :] for text in generated]
+            # generated = sequences
+
+            # prompts.extend(prompt)
+            prompts.append(prompt)
             generateds.extend(generated)
             
-            with jsonlines.open(outputfile, mode='a') as writer:
-                writer.write_all([{
-                    'prompt': prompt, 
-                    'generated': generated,
-                    'answer': batch['answer'][0],
-                    'answer_content': batch['answer_content'][0],
-                    'score': conf if '/scoring/' in outputfile else -1,
-                    'init_values': init_values,
-                }])
+            # with jsonlines.open(outputfile, mode='a') as writer:
+            #     writer.write_all([{
+            #         'prompt': prompt, 
+            #         'generated': generated,
+            #         'answer': batch['answer'][0],
+            #         'answer_content': batch['answer_content'][0],
+            #         'score': conf if '/scoring/' in outputfile else -1,
+            #         'init_values': init_values,
+            #     }])
 
         dist.barrier()
 
-        self.set_train()
+        # self.set_train()
         # import ipdb; ipdb.set_trace()
+        return {
+            'train/eval_accuracy': correct_number / len(prompts),
+            'train/eval_total_num': len(prompts),
+        }
         assert False, """Cannot do eval & train in one process"""
         return {'num': len(generateds)}
 

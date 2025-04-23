@@ -35,6 +35,8 @@ from mcts_rl.algorithms.mcts.mcts import (
     MCTSConfig, 
     TreeConstructor,
 )
+import deepspeed
+import torch.distributed as dist
 
 
 class MCTSTrainer(TSRLTrainer):
@@ -48,6 +50,8 @@ class MCTSTrainer(TSRLTrainer):
         )
         search_cfg = StepLMConfig(SearchArgs(
             ref_policy_model=self.actor_reference_model,
+            inference_model=self.inference_model,
+            vllm_client=self.vllm_client,
             base_tokenizer=self.tokenizer,
             generation_config=self.generation_config,
             n_actions=self.args.n_actions,
@@ -79,15 +83,24 @@ class MCTSTrainer(TSRLTrainer):
             temperature_decay_ratio=self.args.mcts_temperature_decay_ratio,
             consider_diversity=(not self.args.no_consider_diversity),
             length_penalty=self.args.mcts_length_penalty,
+            max_min_multiplier=self.args.max_min_multiplier,
         ))
         self.mcts_searcher = TreeConstructor(
             world_model=world_model, 
             search_config=search_cfg, 
             search_algo=mcts_algo,
         )
+
+    def update_inference_model_weight(self):
+        model = self.inference_model.llm_engine.model_executor.driver_worker.worker.model_runner.model
+        model.load_state_dict(self.mcts_searcher.search_algo.policy_model.module.state_dict())
     
     def tree_constructor(self, prompt_only_batch: PromptOnlyBatch | PromptOnlyPostBatch) -> list[dict[str, Any]]:
         """Rollout a batch of experiences."""
+        # load weights of inference model
+        if self.inference_model is not None:
+            self.update_inference_model_weight()
+
         input_ids = prompt_only_batch['input_ids']
         attention_mask = prompt_only_batch['attention_mask']
         answer = prompt_only_batch['answer']
@@ -416,6 +429,9 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         search_cfg = StepLMConfig(SearchArgs(
             ref_policy_model=self.actor_reference_model,
             ref_policy_model2=self.actor_reference_model2,
+            ref_state_dict=self.ref_state_dict,
+            inference_model=self.inference_model,
+            vllm_client=self.vllm_client,
             base_tokenizer=self.tokenizer,
             generation_config=self.generation_config,
             n_actions=self.args.n_actions,
@@ -447,15 +463,74 @@ class MCTSWDPOPTrainer(TSRLTrainer):
             temperature_decay_ratio=self.args.mcts_temperature_decay_ratio,
             consider_diversity=(not self.args.no_consider_diversity),
             length_penalty=self.args.mcts_length_penalty,
+            max_min_multiplier=self.args.max_min_multiplier,
         ))
         self.mcts_searcher = TreeConstructor(
             world_model=world_model, 
             search_config=search_cfg, 
             search_algo=mcts_algo,
         )
-    
-    def tree_constructor(self, prompt_only_batch: PromptOnlyBatch | PromptOnlyPostBatch) -> list[dict[str, Any]]:
+
+
+    def update_inference_model_weight(self):
+        """
+        Updates the inference model's weights using parameters from self.actor_model
+        under ZeRO Stage 3. Gathers the full parameter on rank 0, copies each
+        Parameter's data into a state_dict() of Tensors, and then calls a custom
+        load_weights() method on the inference model.
+        """
+        # params_list = list(self.actor_model.module.parameters())
+        for name, param in self.actor_model.module.named_parameters():
+            
+            with deepspeed.zero.GatheredParameters([param], modifier_rank=0):
+                if dist.get_rank() == 0:
+                    # try:
+                    self.mcts_searcher.search_config.vllm_client.update_named_param(name, param.data)
+                    # except Exception as e:
+                        # print(e)
+                        # pass
+        self.mcts_searcher.search_config.vllm_client.reset_prefix_cache()
+        # 1) Get the list of parameters from the actor model
+        # params_list = list(self.actor_model.module.parameters())
+
+        # # 2) Use GatheredParameters so each rank has the full parameter on rank=0
+        # #    (modifier_rank=0). Other ranks will see sharded params as usual.
+        # with deepspeed.zero.GatheredParameters(params_list, modifier_rank=0):
+        #     if dist.get_rank() == 0:
+        #         # 3) Get the actor model's state dict. This includes both
+        #         #    learnable parameters and buffers (e.g. BatchNorm stats).
+        #         actor_model_state_dict = self.actor_model.module.state_dict()
+
+        #         # 4) Copy the live Parameter data into the state_dict Tensors.
+        #         #    This ensures the state_dict has up-to-date weights in Tensor form.
+        #         for name, param in self.actor_model.module.named_parameters():
+        #             # Safely copy the param data into the existing Tensor in state_dict
+        #             # (rather than replacing actor_model_state_dict[name] with a Parameter)
+        #             if name in actor_model_state_dict:
+        #                 actor_model_state_dict[name].copy_(param.data)
+
+        #         # 5) Retrieve the inference model and load the updated state.
+        #         #    The call below assumes `model.load_weights(...)` can handle
+        #         #    an iterable of (name, tensor) pairs.
+        #         model = self.inference_model.llm_engine.model_executor.driver_worker.worker.model_runner.model
+        #         model.load_weights(actor_model_state_dict.items())
+
+        # 6) (Optional) If other ranks also need these updated weights for inference
+        #    locally, you could broadcast them from rank 0 and load them there too.
+        #    This depends on your workflow.
+    def tree_constructor(self, prompt_only_batch: PromptOnlyBatch | PromptOnlyPostBatch) -> list[dict[str, Any]] | str:
         """Rollout a batch of experiences."""
+        # load weights of inference model
+        # if self.inference_model is not None:
+        if self.mcts_searcher.search_config.vllm_client is not None and self.accumulate_gradients_count % self.args.gradient_accumulation_steps == 0 and self.accumulate_gradients_count != 0:
+            self.update_inference_model_weight()
+
+        # initialize max_q, min_q
+        self.mcts_searcher.search_algo.max_reward = 0.0
+        self.mcts_searcher.search_algo.min_reward = 0.0
+        self.mcts_searcher.search_algo.max_q = 0.0
+        self.mcts_searcher.search_algo.min_q = 0.0
+
         input_ids = prompt_only_batch['input_ids']
         attention_mask = prompt_only_batch['attention_mask']
         answer = prompt_only_batch['answer']
@@ -475,6 +550,7 @@ class MCTSWDPOPTrainer(TSRLTrainer):
             self.mcts_searcher.search_algo.policy_model = self.actor_reference_model if self.args.offline else self.actor_model
         target_probs, Q_values, r_values, base_values, visit_counts, select_indexes = [], [], [], [], [], []
         cur_node = None
+        no_valid_action_flag = False
         while cur_node is None or not cur_node.is_terminal:
             if cur_node is not None and (self.tokenizer.eos_token_id in cur_node.action or self.tokenizer.convert_tokens_to_ids("<|eot_id|>") in cur_node.action):
                 cur_node.is_terminal = True
@@ -485,6 +561,10 @@ class MCTSWDPOPTrainer(TSRLTrainer):
                 'answer': gt_answer, 'reasoning': solution,
                 'answer_content': prompt_only_batch['answer_content'][0],
             }, node=cur_node, policy_model=self.actor_model)
+            if mcts_rst == 'No valid actions':
+                no_valid_action_flag = True
+                break
+                # return mcts_rst
             pi, cur_node = mcts_rst.next_action_pi, mcts_rst.tree_state
             target_probs.append(pi)
             Q_values.append([child.Q for child in cur_node.children])
@@ -496,9 +576,42 @@ class MCTSWDPOPTrainer(TSRLTrainer):
             select_indexes.append(mcts_rst.next_action_idx)
             
             if self.args.n_actions == 1: break
-        
+        if cur_node.is_terminal and cur_node.is_correct == False and len(prompt_only_batch.get('step_solution', [])) != 0 and no_valid_action_flag == False:
+            print('Wrong answer, addtional tree search')
+            self.number_of_wrong_answers += 1
+            
+            additional_tree_search = True
+            while cur_node.depth:
+                cur_node = cur_node.parent
+
+            while cur_node is None or not cur_node.is_terminal:
+                if cur_node is not None and cur_node.action is not None and (self.tokenizer.eos_token_id in cur_node.action or self.tokenizer.convert_tokens_to_ids("<|eot_id|>") in cur_node.action):
+                    cur_node.is_terminal = True
+                    break
+                # MCTS for next step
+                mcts_rst = self.mcts_searcher({
+                    'input_ids': seq, 'attention_mask': attn_msk,
+                    'answer': gt_answer, 'reasoning': solution,
+                    'answer_content': prompt_only_batch['answer_content'][0],
+                    'step_solution': prompt_only_batch['step_solution'],
+                    
+                }, node=cur_node, policy_model=self.actor_model, additional_tree_search=additional_tree_search)
+                # if mcts_rst == 'No valid actions':
+                #     return mcts_rst
+                pi, cur_node = mcts_rst.next_action_pi, mcts_rst.tree_state
+                target_probs.append(pi)
+                Q_values.append([child.Q for child in cur_node.children])
+                r_values.append([child.r for child in cur_node.children])
+                base_values.append([child.value for child in cur_node.children])
+                visit_counts.append([child.N for child in cur_node.children])
+                
+                cur_node = cur_node.children[mcts_rst.next_action_idx]
+                select_indexes.append(mcts_rst.next_action_idx)
+                
+                if self.args.n_actions == 1: break
         dist.barrier()
-        
+        if no_valid_action_flag:
+            return 'No valid actions'
         return [
             self.post_tree_construct(
                 prompt=input_ids[idx],
@@ -529,8 +642,10 @@ class MCTSWDPOPTrainer(TSRLTrainer):
             current_node = path_nodes[-1]
             if not current_node.children:
                 # We reached a leaf => build a full solution from path_nodes
-                step_actions, step_ws, ref_probs, sum_w = self.build_solution(path_nodes, max_q, min_q)
-                solutions.append((step_actions, step_ws, ref_probs, sum_w))
+                # step_actions, step_ws, ref_probs, sum_w = self.build_solution(path_nodes, max_q, min_q)
+                step_actions, step_ws, ref_probs, mean_w, full_texts, is_solution_correct, is_terminal = self.build_solution(path_nodes, max_q, min_q)
+                # solutions.append((step_actions, step_ws, ref_probs, sum_w))
+                solutions.append((step_actions, step_ws, ref_probs, mean_w, full_texts, is_solution_correct, is_terminal))
                 return
 
             for child in current_node.children:
@@ -552,11 +667,13 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         step_actions = []
         step_ws = []
         ref_probs = []
+        full_texts = []
         # If your root has no action, you can skip the root in iteration, or
         # include it if you prefer. This example starts from node_1 = path_nodes[1].
         for node in path_nodes[1:]:  
             # 1) The token(s) for this node
             step_actions.append(node.action)
+            full_texts.append(node.prompt + node.text)
 
             # 2) Convert node.Q -> w_t
             node_q = node.Q  # or wherever you store the Q
@@ -564,11 +681,18 @@ class MCTSWDPOPTrainer(TSRLTrainer):
                 w_t = (node_q - min_q) / (max_q - min_q)
             else:
                 w_t = 0.5
+            if w_t > 1.0:
+                w_t = 1.0
+            elif w_t < 0.0:
+                w_t = 0.0
             step_ws.append(w_t)
             ref_probs.append(node.ref_log_probs.sum())
+        is_solution_correct = path_nodes[-1].is_correct
+        is_terminal = path_nodes[-1].is_terminal
 
-        sum_w = sum(step_ws)
-        return step_actions, step_ws, ref_probs, sum_w
+        # sum_w = sum(step_ws)
+        mean_w = sum(step_ws) / len(step_ws)
+        return step_actions, step_ws, ref_probs, mean_w, full_texts, is_solution_correct, is_terminal
     
     def post_tree_construct(
         self,
@@ -608,15 +732,39 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         }
         max_q = self.mcts_searcher.search_algo.max_q
         min_q = self.mcts_searcher.search_algo.min_q
+        max_reward = self.mcts_searcher.search_algo.max_reward
+        min_reward = self.mcts_searcher.search_algo.min_reward
         all_solutions = self.gather_all_solutions(cur_node, max_q, min_q)
-
+        winner_idx = 0
+        loser_idx = 0
+        is_winner_terminal = True
+        # To check there is correct solution in all_solutions
+        if any([solution[5] for solution in all_solutions]):
         # 2) Identify winner (max sum_w) and loser (min sum_w)
-        winner_idx = max(range(len(all_solutions)), key=lambda i: all_solutions[i][3])
-        loser_idx  = min(range(len(all_solutions)), key=lambda i: all_solutions[i][3])
+            winner_candidates = [solution for solution in all_solutions if solution[5]]
+            winner_idx = max(range(len(winner_candidates)), key=lambda i: winner_candidates[i][3])
+        else:
+            winner_idx = max(range(len(all_solutions)), key=lambda i: all_solutions[i][3])
+            is_winner_terminal = all_solutions[winner_idx][6]
+        loser_candidates = [solution for solution in all_solutions if not solution[5] and solution[6]]
+        if any([not solution[5] for solution in all_solutions]) and any([solution[6] for solution in all_solutions]) and len(loser_candidates) > 0:
+            
+            loser_idx = min(range(len(loser_candidates)), key=lambda i: loser_candidates[i][3])
+            
+        else:
+            loser_idx  = min(range(len(all_solutions)), key=lambda i: all_solutions[i][3])
 
 
-        winner_step_actions, winner_w_list, winner_ref_probs, _ = all_solutions[winner_idx]
-        loser_step_actions,  loser_w_list,  loser_ref_probs, _ = all_solutions[loser_idx]
+        winner_step_actions, winner_w_list, winner_ref_probs, _, winner_full_text, _, _ = all_solutions[winner_idx]
+        if any([solution[5] for solution in all_solutions]):
+            winner_step_actions, winner_w_list, winner_ref_probs, _, winner_full_text, _, _ = winner_candidates[winner_idx]
+        loser_step_actions,  loser_w_list,  loser_ref_probs, _, loser_full_text, _, _ = all_solutions[loser_idx]
+        if any([not solution[5] for solution in all_solutions]) and any([solution[6] for solution in all_solutions]) and len(loser_candidates) > 0:
+            loser_step_actions,  loser_w_list,  loser_ref_probs, _, loser_full_text, _, _ = loser_candidates[loser_idx]
+        print(f'#### Winner: {winner_full_text[-1]}')
+        print(f'#### Winner w: {winner_w_list}')
+        print(f'#### Loser: {loser_full_text[-1]}')
+        print(f'#### Loser w: {loser_w_list}')
 
         winner_step_actions[0] = torch.cat([prompt, winner_step_actions[0]], dim=-1)
         loser_step_actions[0] = torch.cat([prompt, loser_step_actions[0]], dim=-1)
@@ -654,7 +802,8 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         mini_batches['loser_ref_probs'].append(loser_ref_probs)
 
         # (Optional) correctness check
-        r = max(r_values[-1]) if r_values else 0
+        # r = max(r_values[-1]) if r_values else 0
+        r = max_q
         is_correct = False
         if len(mini_batches['winner_input_ids_list']):
             text = self.tokenizer.decode(winner_input_ids, skip_special_tokens=True)
@@ -666,8 +815,11 @@ class MCTSWDPOPTrainer(TSRLTrainer):
                     is_correct = csr_equal(prediction, ('(' + solution[1].strip() + ')', ''))
                 else:
                     is_correct = math_equal(extract_answer(prediction), extract_answer(f'{solution[0]}\nThe answer is {solution[1]}'))
+        if not is_winner_terminal:
+            print('Winner is not terminal')
+            is_correct = False
         
-        mini_batches['prediction'] = [r, is_correct]
+        mini_batches['prediction'] = [r, is_correct, min_q, max_reward, min_reward]
         mini_batches['cur_max_new_tokens'] = cur_max_new_tokens
 
         # self.replay_buffer.add(mini_batches)
@@ -726,9 +878,10 @@ class MCTSWDPOPTrainer(TSRLTrainer):
 
         prediction: tuple = (0.0, False),
         cur_max_new_tokens: int = 32,
-        beta: float = 1.0,         # WDPOP coefficient on log-ratios
-        lambda_: float = 1.0,      # WDPOP hinge weight
+        beta: float = 0.3,         # WDPOP coefficient on log-ratios
+        lambda_: float = 5.0,      # WDPOP hinge weight
         num_step: int = 0,
+        label_smoothing: float = 0.1,
     ) -> dict[str, Any]:
         """
         Implements the WDPOP loss:
@@ -745,7 +898,9 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         Note: Using the same model for policy and reference will yield diff = 0.
         """
         device = winner_input_ids_list[0].device if winner_input_ids_list else "cpu"
-        
+        print('#### step start ####')
+        print('winner_w_list:', winner_w_list)
+        print('loser_w_list:', loser_w_list)
         # -----------------------------------
         # Combine and pad winner and loser sequences.
         # -----------------------------------
@@ -827,8 +982,14 @@ class MCTSWDPOPTrainer(TSRLTrainer):
             w_pad_len = winner_input_id_pad_len_list[i]
             l_pad_len = loser_input_id_pad_len_list[i]
             # Slice the log-probabilities.
-            w_log_probs = winner_log_probs_batch[i][prompt_len - 1: -w_pad_len]
-            l_log_probs = loser_log_probs_batch[i][prompt_len - 1: -l_pad_len]
+            if w_pad_len > 0:
+                w_log_probs = winner_log_probs_batch[i][prompt_len - 1: -w_pad_len]
+            else:
+                w_log_probs = winner_log_probs_batch[i][prompt_len - 1:]
+            if l_pad_len > 0:
+                l_log_probs = loser_log_probs_batch[i][prompt_len - 1: -l_pad_len]
+            else:
+                l_log_probs = loser_log_probs_batch[i][prompt_len - 1:]
 
             # w_log_probs = winner_log_probs_batch[i][:w_len]
             # l_log_probs = loser_log_probs_batch[i][:l_len]
@@ -853,23 +1014,30 @@ class MCTSWDPOPTrainer(TSRLTrainer):
             step_hinge = 0.0
             step_actions = winner_step_actions_list[i]  # List of per-step Tensors.
             step_weights = winner_w_list[i]             # List of corresponding weights.
-            running_idx = prompt_len
+            running_idx = 0
             for actions_t, w_t, step_log_ref in zip(step_actions, step_weights, winner_ref_probs[i]):
                 step_len = actions_t.size(-1)
-                if running_idx == prompt_len:
+                if running_idx == 0:
                     step_len = actions_t.size(-1) - prompt_len
                 step_log_theta = w_log_probs[running_idx: running_idx + step_len].sum()
                 # step_log_ref   = ref_w_log_probs[running_idx: running_idx + step_len].sum()
                 running_idx += step_len
                 # Hinge: beta * w_t * max(0, (log π_ref - log π_θ))
+                # w_t = 1.0
                 step_hinge += beta * w_t * torch.clamp(step_log_ref - step_log_theta, min=0.0)
                 # if num_step == 0:
                 #     step_hinge += beta * w_t * (-step_log_theta)
             hinge_penalty = lambda_ * step_hinge
 
             # Compute the WDPOP loss for this sample.
-            total_loss_i = -F.logsigmoid(diff - hinge_penalty)
-            losses.append(total_loss_i)
+            logits = diff - hinge_penalty
+            # total_loss_i = -F.logsigmoid(diff - hinge_penalty)
+            # total_loss_i = -F.logsigmoid(diff)
+            # losses.append(total_loss_i)
+            losses.append(
+                - F.logsigmoid(self.scale_coeff * logits) * (1 - label_smoothing)
+                - F.logsigmoid(-self.scale_coeff * logits) * label_smoothing
+            )
             hinge_terms.append(step_hinge.item())
 
         if not losses:
@@ -880,6 +1048,8 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         # Backward pass and optimizer step.
         torch.cuda.empty_cache()
         self.actor_model.backward(loss)
+        self.accumulate_gradients_count += 1
+
         self.actor_model.step()
         total_grad_norm = 0.0
         for param in self.actor_model.module.parameters():

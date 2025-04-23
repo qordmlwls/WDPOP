@@ -251,6 +251,7 @@ def get_optimizer_grouped_parameters(
 
 def gather_log_probabilities(logits: torch.Tensor, labels: torch.LongTensor) -> torch.Tensor:
     """Gather log probabilities of the given labels from the logits."""
+    torch.cuda.empty_cache()
     log_probs = F.log_softmax(logits, dim=-1)
     log_probs_labels = log_probs.gather(dim=-1, index=labels.unsqueeze(dim=-1))
     return log_probs_labels.squeeze(dim=-1)
@@ -295,7 +296,7 @@ def check_available(rl_batch, max_tokens=512, eos_token_id=2, to_filter=False, m
             return False
         if rl_batch[input_ids_list][-1].size(-1) >= max_tokens and eos_token_id not in rl_batch[input_ids_list][-1][-1]:
             return False
-        return rl_batch.get('prediction', [False])[-1] > 0.8 # or random.random() < .1
+        return rl_batch.get('prediction', [False])[1] > 0.8 # or random.random() < .1
     input_ids_list = rl_batch[input_ids_list]
     counts = [
         input_ids.size(0) >= 2 and input_ids.size(-1) <= max_tokens and (input_ids[0] != input_ids[1]).nonzero().size(0)
@@ -383,7 +384,10 @@ def strip_string(string):
 
     # Remove unit: miles, dollars if after is not none
     _string = re.sub(r"\\text{.*?}$", "", string).strip()
-    _string = re.sub(r" [\w\.\s]+$", "", string).strip()
+    # if string != re.sub(r" [\w\.\s]+$", "", string).strip():
+    #     print("need to remove unit: '{}' -> '{}'".format(string, re.sub(r" [\w\.\s]+$", "", string).strip()))
+    # _string = re.sub(r" [\w\.\s]+$", "", string).strip()
+    _string = re.sub(r"\s+(?:miles|dollars)\.?$", "", _string, flags=re.IGNORECASE).strip()
     if _string != "" and _string != string:
         # print("Warning: unit not removed: '{}' -> '{}'".format(string, _string))
         string = _string
@@ -484,9 +488,10 @@ def extract_answer(pred_str, use_code=False):
     
     if 'USER:' in pred_str:
         pred_str = pred_str.split('USER:')[0]
-
-    if 'boxed' in pred_str:
-        ans = pred_str.split('boxed')[-1]
+    # print(pred_str)
+    if 'boxed{' in pred_str or '\boxed' in pred_str:
+        
+        ans = pred_str.split('boxed')[-1] if 'boxed' in pred_str else pred_str.split('\boxed')[-1]
         if len(ans) == 0:
             return ""
         elif (ans[0] == '{'):

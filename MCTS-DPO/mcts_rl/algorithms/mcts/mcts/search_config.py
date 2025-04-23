@@ -10,8 +10,8 @@ from string import punctuation
 import re
 
 import nltk
-# nltk.download('punkt')
-# nltk.download('punkt_tab')
+nltk.download('punkt')
+nltk.download('punkt_tab')
 from nltk.tokenize import sent_tokenize
 
 import deepspeed
@@ -20,6 +20,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from transformers import GenerationConfig, PreTrainedTokenizerBase, AutoModelForCausalLM
 from transformers.tokenization_utils import TruncationStrategy
+from transformers import TextStreamer
 
 from mcts_rl.algorithms.mcts.mcts.base import SearchConfig
 from mcts_rl.algorithms.mcts.mcts.world_model import StepLMState, StepLMAction
@@ -32,12 +33,18 @@ from mcts_rl.configs import (
     LLAMA3_PROMPT_ASSISTANT, LLAMA3_PROMPT_ASSISTANT_MCQ,
     LLAMA3_HINTED_EVAL_PROMPT, LLAMA3_EVAL_PROMPT_ASSISTANT,
 )
+from vllm import SamplingParams, LLM
+from typing import Optional, Dict
+from trl.extras.vllm_client import VLLMClient
 
 
 class SearchArgs(NamedTuple):
     ref_policy_model: deepspeed.DeepSpeedEngine
     base_tokenizer: PreTrainedTokenizerBase
     ref_policy_model2: deepspeed.DeepSpeedEngine = None
+    inference_model: Optional[LLM] = None
+    vllm_client: Optional[VLLMClient] = None
+    ref_state_dict: Optional[Dict] = None
     generation_config: GenerationConfig = None
     n_actions: int = 16
     n_init_actions: int = 16
@@ -80,6 +87,7 @@ class StepLMConfig(SearchConfig):
         self.negative_gen = args.negative_gen
         
         self.ref_policy_model = args.ref_policy_model
+        self.inference_model = args.inference_model
         # self.ref_policy_model2 = args.ref_policy_model2
         
         self.base_tokenizer = args.base_tokenizer
@@ -107,6 +115,9 @@ class StepLMConfig(SearchConfig):
             
         self.include_gt = args.include_gt
         self.verbose = args.verbose
+        self.ref_state_dict = args.ref_state_dict
+        self.intermidiate_state_dict = None
+        self.vllm_client = args.vllm_client
 
     def _gather_log_probabilities(self, logits: torch.Tensor, labels: torch.LongTensor) -> torch.Tensor:
         """Gather log probabilities of the given labels from the logits. (ground truth's log probability)"""
@@ -135,6 +146,19 @@ class StepLMConfig(SearchConfig):
             available_indexes.append(idx)
         
         return [raw_results[idx] for idx in available_indexes]
+
+    # def update_policy_weights_with_ref_model(self, policy_model):
+    #     params_list = list(policy_model.parameters())
+    #     import copy
+    #     with deepspeed.zero.GatheredParameters(params_list, modifier_rank=0):
+    #         if dist.get_rank() == 0:
+    #             self.intermidiate_state_dict = copy.deepcopy(policy_model.state_dict())
+    #             for name, param in policy_model.named_parameters():
+    #                 if name in self.intermidiate_state_dict:
+    #                     self.intermidiate_state_dict[name].copy_(param.data)
+    #             policy_model.load_weights(self.ref_state_dict.items())
+    # def update_policy_weights_with_intermidiate_state(self, policy_model):
+    #     policy_model.load_weights(self.intermidiate_state_dict.items())
 
     @torch.no_grad()
     def _get_logits(self, _input_ids: torch.LongTensor, 
@@ -170,46 +194,83 @@ class StepLMConfig(SearchConfig):
         prompt = self.base_tokenizer.decode(input_ids, 
                                             skip_special_tokens=self.model_type != 'llama3', 
                                             clean_up_tokenization_spaces=False)
-        existing_pattern = r'(?:##\s*)?(?:[Ss][Tt][Ee][Pp])\s*(\d+)\s*:\s*'
+        print("## prompt", prompt)
+        existing_pattern = r'(?:##\s*)?(?:[Ss][Tt][Ee][Pp])\s*(\d+)\s*'
         found_steps = re.findall(existing_pattern, prompt, flags=re.IGNORECASE)
         if found_steps:
             # e.g., if the last step was "## Step 3:", current_step is 3
-            current_step = int(found_steps[-1])
+            # current_step = int(found_steps[-1])
+            # max found_stepsis current_step
+            current_step = max([int(x) for x in found_steps])
         else:
             current_step = 0
         next_step = current_step + 1
         next2_step = next_step + 1
-        stop_string = f'## Step {next2_step}:'
+        stop_string = [f'Step {next2_step}']
         # Markers for searching in the new generation
-        next_step_marker_pattern  = rf'(?:##\s*)?(?:[Ss][Tt][Ee][Pp])\s*{next_step}\s*:\s*'
-        next2_step_marker_pattern = rf'(?:##\s*)?(?:[Ss][Tt][Ee][Pp])\s*{next2_step}\s*:\s*'
+        next_step_marker_pattern  = rf'(?:##\s*)?(?:[Ss][Tt][Ee][Pp])\s*{next_step}\s*'
+        next2_step_marker_pattern = rf'(?:##\s*)?(?:[Ss][Tt][Ee][Pp])\s*{next2_step}\s*'
         answer_marker_pattern = r'(?i)(?:the answer is|the final answer is)'
         
         terminators = [self.base_tokenizer.eos_token_id]
         terminators += [self.base_tokenizer.convert_tokens_to_ids("<|eot_id|>")] if self.model_type == 'llama3' else []
         unique_text_list, sequences_list = [], []
+
+        text_streamer = TextStreamer(self.base_tokenizer, skip_prompt = True)
         for _ in trange(n_actions, disable=self.disable_tqdm, desc='Expand: action generation', leave=False):
             cur_max_new_tokens = self.generation_config.max_new_tokens + (0 if self.use_mcq else 16)
             ## sample candidate steps to construct action space from LLMs with some randomness (temperature >= 0)
             if (not self.get_tp_zero) or unique_text_list or prompt.startswith(PROMPT_BEGIN):
                 cur_max_new_tokens = (self.generation_config.max_length - input_ids.size(-1)) if n_actions == 1 else cur_max_new_tokens
                 cur_max_new_tokens = max(1, min(cur_max_new_tokens, self.generation_config.max_length - input_ids.size(-1)))
-                sequences = policy_model.module.generate(
-                    input_ids=input_ids.unsqueeze(0),
-                    attention_mask=attention_mask.unsqueeze(0),
-                    temperature=self.init_temperature if not len(state) else (self.temperature if random.random() < .75 else 1.0),
-                    max_new_tokens=cur_max_new_tokens,
-                    repetition_penalty=self.generation_config.repetition_penalty,
-                    bos_token_id=self.base_tokenizer.bos_token_id,
-                    pad_token_id=self.base_tokenizer.eos_token_id,
-                    do_sample=True,
-                    eos_token_id=terminators,
-                    synced_gpus=True,
-                    # stopping strings
-                    stop_strings=[stop_string],
-                    tokenizer=self.base_tokenizer,
-                )
+                torch.cuda.empty_cache()
+                # dist.barrier()
+                if self.inference_model is not None:
+                    sampling_params = SamplingParams(
+                        # temperature=self.init_temperature if not len(state) else (self.temperature if random.random() < .75 else 1.0),
+                        temperature=self.init_temperature if not len(state) else self.temperature,
+                        top_p=0.9,
+                        repetition_penalty=self.generation_config.repetition_penalty,
+                        stop=stop_string,
+                        max_tokens=cur_max_new_tokens,
+                    )
+                    sequences = self.inference_model.generate(prompt, sampling_params=sampling_params)
+                elif self.vllm_client is not None:
+                    sequences = self.vllm_client.generate(
+                        prompts=[prompt],
+                        repetition_penalty=self.generation_config.repetition_penalty,
+                        temperature=self.init_temperature if not len(state) else self.temperature,
+                        top_p=0.9,
+                        max_tokens=cur_max_new_tokens,
+                        stop=stop_string,
+                    )
+                    sequences = [self.base_tokenizer.decode(torch.tensor(sequences[0]), 
+                                            skip_special_tokens=self.model_type != 'llama3', 
+                                            clean_up_tokenization_spaces=False)]
+                else:
+                    sequences = policy_model.module.generate(
+                        input_ids=input_ids.unsqueeze(0),
+                        attention_mask=attention_mask.unsqueeze(0),
+                        # temperature=self.init_temperature if not len(state) else (self.temperature if random.random() < .75 else 1.0),
+                        temperature=self.init_temperature if not len(state) else self.temperature,
+                        top_p=0.9,
+                        max_new_tokens=cur_max_new_tokens,
+                        repetition_penalty=self.generation_config.repetition_penalty,
+                        bos_token_id=self.base_tokenizer.bos_token_id,
+                        pad_token_id=self.base_tokenizer.eos_token_id,
+                        do_sample=True,
+                        eos_token_id=terminators,
+                        # synced_gpus=True,
+                        # stopping strings
+                        stop_strings=stop_string,
+                        tokenizer=self.base_tokenizer,
+                        streamer=text_streamer,
+                        use_cache=True,
+                    )
+
+                # dist.barrier()
             else:
+                print("else_generate")
                 cur_max_new_tokens = (self.generation_config.max_length - input_ids.size(-1)) if n_actions == 1 else cur_max_new_tokens
                 cur_max_new_tokens = max(1, min(cur_max_new_tokens, self.generation_config.max_length - input_ids.size(-1)))
                 sequences = policy_model.module.generate(
@@ -223,16 +284,34 @@ class StepLMConfig(SearchConfig):
                     eos_token_id=terminators,
                     synced_gpus=True,
                 )
-            
+            # sequences = ['d']
             for seq in sequences:
                 ## get full generated text for current step
-                full_generated = self.base_tokenizer.decode(seq, 
-                                                            skip_special_tokens=self.model_type != 'llama3', 
-                                                            clean_up_tokenization_spaces=False)
-                full_generated = full_generated[len(prompt):] if full_generated.startswith(prompt) else \
-                                        self.base_tokenizer.decode(seq[input_ids.size(-1):], 
-                                                                   skip_special_tokens=self.model_type != 'llama3', 
-                                                                   clean_up_tokenization_spaces=False)
+                if self.inference_model is not None:
+                    full_generated = sequences[0].outputs[0].text
+                    full_generated = full_generated[len(prompt):] if full_generated.startswith(prompt) else full_generated
+                    if full_generated.endswith('## '):
+                        full_generated = full_generated[:-3]
+                    print(full_generated)
+                elif self.vllm_client is not None:
+                    full_generated = sequences[0]
+                    full_generated = full_generated[len(prompt):] if full_generated.startswith(prompt) else full_generated
+                    if full_generated.endswith('## '):
+                        full_generated = full_generated[:-3]
+                    # elif full_generated.endswith(f'## {next2_step}'):
+                    #     full_generated = full_generated[:-len(f'## {next2_step}')]
+                    # elif full_generated.endswith(f'##{next2_step}'):
+                    #     full_generated = full_generated[:-len(f'##{next2_step}')]   
+                    print(full_generated)
+                else:
+                    full_generated = self.base_tokenizer.decode(seq, 
+                                                                skip_special_tokens=self.model_type != 'llama3', 
+                                                                clean_up_tokenization_spaces=False)
+                
+                    full_generated = full_generated[len(prompt):] if full_generated.startswith(prompt) else \
+                                            self.base_tokenizer.decode(seq[input_ids.size(-1):], 
+                                                                    skip_special_tokens=self.model_type != 'llama3', 
+                                                                    clean_up_tokenization_spaces=False)
                 match1 = re.search(next_step_marker_pattern, full_generated, flags=re.IGNORECASE)
                 match2 = re.search(next2_step_marker_pattern, full_generated, flags=re.IGNORECASE)
                 match_answer = re.search(answer_marker_pattern, full_generated, flags=re.IGNORECASE)
@@ -266,16 +345,16 @@ class StepLMConfig(SearchConfig):
                             and all(not sent.strip().endswith(x) for x in [':', '(', '['])):
                             sentences.append(sent)
                             sent, subcnt = '', 0
-                for i, raw_sent in enumerate(sentences):
-                    ## identify end of sentence
-                    if ' answer is' in raw_sent and not raw_sent.endswith(' answer is'):
-                        if self.model_type == 'llama3':
-                            if "<|eot_id|>" not in raw_sent:
-                                sentences[i] += "<|eot_id|>"
-                        elif self.base_tokenizer.eos_token not in raw_sent:
-                            sentences[i] += self.base_tokenizer.eos_token
-                        sentences = sentences[:i + 1]
-                        break
+                # for i, raw_sent in enumerate(sentences):
+                #     ## identify end of sentence
+                #     if ' answer is' in raw_sent and not raw_sent.endswith(' answer is'):
+                #         if self.model_type == 'llama3':
+                #             if "<|eot_id|>" not in raw_sent:
+                #                 sentences[i] += "<|eot_id|>"
+                #         elif self.base_tokenizer.eos_token not in raw_sent:
+                #             sentences[i] += self.base_tokenizer.eos_token
+                #         sentences = sentences[:i + 1]
+                #         break
                 
                 ## collect generation as steps
                 sents = []
@@ -287,8 +366,7 @@ class StepLMConfig(SearchConfig):
                 elif sentences[-1].rstrip().endswith('.') or len(sentences) < 2:
                     # fullstop / cannot break down --> accept as a valid step
                     sents = sentences
-                elif len(state) and ((seq.size(-1) - input_ids.size(-1) < cur_max_new_tokens) or 
-                    any(x in ''.join(sentences) for x in ["<|eot_id|>", self.base_tokenizer.eos_token])):
+                elif len(state) and (any(x in ''.join(sentences) for x in ["<|eot_id|>", self.base_tokenizer.eos_token])):
                     # reach a terminate state
                     sents = sentences
                 elif self.n_actions > 1 and len(self.base_tokenizer.encode(' '.join(sentences[:-1]))) >= cur_max_new_tokens * 7/8:
@@ -316,7 +394,7 @@ class StepLMConfig(SearchConfig):
                     add_special_tokens=self.model_type != 'llama3',
                     truncation=TruncationStrategy.LONGEST_FIRST,
                     return_tensors='pt',
-                )['input_ids'][0].to(seq.device)
+                )['input_ids'][0].to(input_ids.device)
 
                 gen_ids = gen_ids[input_ids.size(-1):]
                 if not gen_ids.size(-1):
@@ -366,13 +444,13 @@ class StepLMConfig(SearchConfig):
         #         cur_step += step
         
         ## add eos token
-        if not len(sequences_list):
-            if self.model_type == 'llama3':
-                sequences_list.append(torch.tensor([self.base_tokenizer.convert_tokens_to_ids("<|eot_id|>")]).to(input_ids.device))
-                unique_text_list.append("<|eot_id|>")
-            else:
-                sequences_list.append(torch.tensor([self.base_tokenizer.eos_token_id]).to(input_ids.device))
-                unique_text_list.append(self.base_tokenizer.eos_token)
+        # if not len(sequences_list):
+        #     if self.model_type == 'llama3':
+        #         sequences_list.append(torch.tensor([self.base_tokenizer.convert_tokens_to_ids("<|eot_id|>")]).to(input_ids.device))
+        #         unique_text_list.append("<|eot_id|>")
+        #     else:
+        #         sequences_list.append(torch.tensor([self.base_tokenizer.eos_token_id]).to(input_ids.device))
+        #         unique_text_list.append(self.base_tokenizer.eos_token)
         
         ## gather result candidate steps (text, embeddings, logits, logprobs)
         results = []
@@ -382,17 +460,59 @@ class StepLMConfig(SearchConfig):
                 seq_input_ids.not_equal(self.base_tokenizer.pad_token_id),
                 seq_input_ids.not_equal(self.base_tokenizer.unk_token_id),
             )
+            torch.cuda.empty_cache()
+            print("logits")
+            # if self.ref_state_dict is not None:
+            #     self.update_policy_weights_with_ref_model(policy_model.module)
             logits, hidden_states = self._get_logits(seq_input_ids, attention_mask=seq_attention_mask, model=policy_model.module)
+            # dist.barrier()
             log_probs = self._gather_log_probabilities(logits[input_ids.size(-1)-1:-1, :], gen_ids.to(logits.device)) # input_ids.size(-1) -1: -1 input id's last token for predicting the next token and -1 since the prediction of the last token is not needed 
             embs = hidden_states[input_ids.size(-1):]
             # if add_kl:
+            torch.cuda.empty_cache()
+            # if self.ref_state_dict is not None:
+            #     self.update_policy_weights_with_intermidiate_state(policy_model.module)
             ref_logits, _ = self._get_logits(seq_input_ids, attention_mask=seq_attention_mask, model=self.ref_policy_model.module)
+            # dist.barrier()
             ref_log_probs = self._gather_log_probabilities(ref_logits[input_ids.size(-1)-1:-1, :], gen_ids.to(ref_logits.device))
             # else:
             #     ref_log_probs = None
             results.append((gen_ids, (prompt, text), (log_probs, ref_log_probs), embs))
         return self._filter_via_similarity(results)
+    
+    @torch.no_grad()
+    def get_additional_actions(self, policy_model, state: StepLMState, is_terminal_flag, step: str) -> tuple:
+        # final step
+        if is_terminal_flag:
+            step = step + "<|eot_id|>" if self.model_type == 'llama3' else step + self.base_tokenizer.eos_token
+        input_ids, attention_mask = self._get_sequence_ids_in_path(state)
+        prompt = self.base_tokenizer.decode(input_ids, 
+                                            skip_special_tokens=self.model_type != 'llama3', 
+                                            clean_up_tokenization_spaces=False)
+        gen_ids = self.base_tokenizer(
+            step,
+            add_special_tokens=self.model_type != 'llama3',
+            truncation=TruncationStrategy.LONGEST_FIRST,
+            return_tensors='pt',
+        )['input_ids'][0].to(input_ids.device)
+        seq_input_ids = torch.cat((input_ids, gen_ids), dim=-1).unsqueeze(0)       
+        seq_attention_mask = torch.logical_and(
+            seq_input_ids.not_equal(self.base_tokenizer.pad_token_id),
+            seq_input_ids.not_equal(self.base_tokenizer.unk_token_id),
+        )
+        torch.cuda.empty_cache()
+        # self.update_policy_weights_with_ref_model(policy_model.moudule)
 
+        logits, hidden_states = self._get_logits(seq_input_ids, attention_mask=seq_attention_mask, model=policy_model.module)
+        log_probs = self._gather_log_probabilities(logits[input_ids.size(-1)-1:-1, :], gen_ids)
+        torch.cuda.empty_cache()
+        # self.update_policy_weights_with_intermidiate_state(policy_model.module)
+        
+        ref_logits, _ = self._get_logits(seq_input_ids, attention_mask=seq_attention_mask, model=self.ref_policy_model.module)
+        ref_log_probs = self._gather_log_probabilities(ref_logits[input_ids.size(-1)-1:-1, :], gen_ids)
+        result = (gen_ids, (prompt, step), (log_probs, ref_log_probs), hidden_states[input_ids.size(-1):])
+        return result
+        
     def _append_action(self, input_ids: torch.LongTensor, action: list[int]) -> torch.LongTensor:
         return torch.cat((
             input_ids,
@@ -491,7 +611,7 @@ class StepLMConfig(SearchConfig):
                             return_dict_in_generate=True,
                             pad_token_id=self.base_tokenizer.eos_token_id,
                         )
-                        
+                        # dist.barrier()
                         sequences, scores = sequences.sequences.cpu(), sequences.scores
                         seq = sequences[0][eval_inputs['input_ids'].size(-1):]
                         response = self.base_tokenizer.decode(seq, skip_special_tokens=True)

@@ -12,8 +12,13 @@ export PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export LOGLEVEL="${LOGLEVEL:-WARNING}"
 
 # Set the model names as per the launch configuration.
-ACTOR_MODEL_NAME_OR_PATH="meta-llama/Llama-3.1-8B-Instruct"
+# ACTOR_MODEL_NAME_OR_PATH="meta-llama/Llama-3.1-8B-Instruct"
 ACTOR_REF_MODEL_NAME_OR_PATH="meta-llama/Llama-3.1-8B-Instruct"
+# ACTOR_MODEL_NAME_OR_PATH="Bllossom/llama-3.2-Korean-Bllossom-3B"
+ACTOR_MODEL_NAME_OR_PATH="MCTS-DPO/outputs/checkpoints/arithmetic/cdpo-2x2-gtsft/steps832/"
+# ACTOR_REF_MODEL_NAME_OR_PATH="Bllossom/llama-3.2-Korean-Bllossom-3B"
+# ACTOR_MODEL_NAME_OR_PATH="NakJun/Llama-3.2-1B-Instruct-ko-QuAD"
+# ACTOR_REF_MODEL_NAME_OR_PATH="NakJun/Llama-3.2-1B-Instruct-ko-QuAD"
 
 # Use the output directory from the launch configuration.
 OUTPUT_DIR="/workspace/MCTS-DPO/MCTS-DPO/outputs/checkpoints/arithmetic/cdpo-2x2-gtsft"
@@ -39,7 +44,7 @@ fi
 # Set MASTER_PORT as in launch.json.
 MASTER_PORT="29085"
 # Set include host as per launch.json.
-INCLUDE_HOST="localhost:0"
+INCLUDE_HOST="localhost:0,1"
 
 exec 1> >(tee "${OUTPUT_DIR}/stdout.log" >&1) 2> >(tee "${OUTPUT_DIR}/stderr.log" >&2)
 
@@ -54,7 +59,6 @@ deepspeed --include "${INCLUDE_HOST}" --master_port "${MASTER_PORT}" \
     --iteration_interval 64 \
     --actor_model_name_or_path "${ACTOR_MODEL_NAME_OR_PATH}" \
     --actor_ref_model_name_or_path "${ACTOR_REF_MODEL_NAME_OR_PATH}" \
-    --hf_token "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" \
     --scale_coeff 0.1 \
     --max_length 1024 \
     --temperature 1.0 \

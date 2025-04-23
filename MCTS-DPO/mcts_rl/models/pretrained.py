@@ -200,7 +200,12 @@ def load_pretrained_models(  # pylint: disable=too-many-arguments
         token=hf_token,
         **auto_tokenizer_kwargs,
     )
-    resize_tokenizer_embedding(tokenizer=tokenizer, model=model)
+    try:
+        len(tokenizer)
+        resize_tokenizer_embedding(tokenizer=tokenizer, model=model)
+    except TypeError:
+        pass
+    
     
     # if lora_enable and auto_model_type != PeftModelForCausalLM:
     #     from peft import LoraConfig, get_peft_model

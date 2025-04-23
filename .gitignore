@@ -155,3 +155,4 @@ MCTS-DPO/.vscode/
 checkpoint/
 
 wandb/
+test
