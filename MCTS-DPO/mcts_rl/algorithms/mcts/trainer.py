@@ -628,7 +628,7 @@ class MCTSWDPOPTrainer(TSRLTrainer):
             for idx in range(input_ids.size(0))
         ]
     
-    def gather_all_solutions(self, node, max_q, min_q):
+    def gather_all_solutions(self, node, max_q, min_q, depth_limit):
         """
         Traverse the entire tree (rooted at `node`) and return a list of solutions.
         Each solution is a tuple: (step_actions, step_ws, sum_w).
@@ -643,7 +643,7 @@ class MCTSWDPOPTrainer(TSRLTrainer):
             if not current_node.children:
                 # We reached a leaf => build a full solution from path_nodes
                 # step_actions, step_ws, ref_probs, sum_w = self.build_solution(path_nodes, max_q, min_q)
-                step_actions, step_ws, ref_probs, mean_w, full_texts, is_solution_correct, is_terminal = self.build_solution(path_nodes, max_q, min_q)
+                step_actions, step_ws, ref_probs, mean_w, full_texts, is_solution_correct, is_terminal = self.build_solution(path_nodes, max_q, min_q, depth_limit)
                 # solutions.append((step_actions, step_ws, ref_probs, sum_w))
                 solutions.append((step_actions, step_ws, ref_probs, mean_w, full_texts, is_solution_correct, is_terminal))
                 return
@@ -657,7 +657,7 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         dfs([node])
         return solutions
     
-    def build_solution(self, path_nodes, max_q, min_q):
+    def build_solution(self, path_nodes, max_q, min_q, depth_limit):
         """
         Given a list of nodes [root, ..., leaf], build:
         - step_actions: [node_1.action, node_2.action, ...]
@@ -691,7 +691,12 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         is_terminal = path_nodes[-1].is_terminal
 
         # sum_w = sum(step_ws)
+        # if is_solution_correct:
+        #     mean_w = sum(step_ws[:depth_limit]) / len(step_ws)
+        # else:
+        #     mean_w = sum(step_ws) / len(step_ws)
         mean_w = sum(step_ws) / len(step_ws)
+        
         return step_actions, step_ws, ref_probs, mean_w, full_texts, is_solution_correct, is_terminal
     
     def post_tree_construct(
@@ -734,7 +739,7 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         min_q = self.mcts_searcher.search_algo.min_q
         max_reward = self.mcts_searcher.search_algo.max_reward
         min_reward = self.mcts_searcher.search_algo.min_reward
-        all_solutions = self.gather_all_solutions(cur_node, max_q, min_q)
+        all_solutions = self.gather_all_solutions(cur_node, max_q, min_q, self.mcts_searcher.search_algo.depth_limit)
         winner_idx = 0
         loser_idx = 0
         is_winner_terminal = True

@@ -119,13 +119,18 @@ class MCTSNode(Generic[State, Action]):
             return self.value if self.parent is None else (self.value - self.parent.value)
         # TODO: consider KL divergence in MCTS
         elif self.rewards == 'WDPOP' and not self.is_terminal:
-            return (self.log_probs.sum() - self.ref_log_probs.sum()).detach().item()
-            # return 0.0
+            # return (self.log_probs.sum() - self.ref_log_probs.sum()).detach().item()
+            return 0.0
         elif self.is_terminal:
             if self.is_correct:
-                return self.max_min_multiplier * self.max_reward if self.max_reward > 1.0 else 1.0 * self.max_min_multiplier
+                return self.max_min_multiplier * self.max_reward 
+                # return self.max_min_multiplier * self.max_reward if self.max_reward > 1.0 else 1.0 * self.max_min_multiplier
+            
+                # return 1.0
             else:
-                return self.max_min_multiplier * self.min_reward if self.min_reward < -1.0 else -1.0 * self.max_min_multiplier
+                # return self.max_min_multiplier * self.min_reward if self.min_reward < -1.0 else -1.0 * self.max_min_multiplier
+                return self.max_min_multiplier * self.min_reward
+                # return -1.0
         # return self.rewards.mean().detach().item() + (self.value if self.parent is None else (self.value - self.parent.value))
         raise ValueError('Should not consider kl divergence here!')
     
