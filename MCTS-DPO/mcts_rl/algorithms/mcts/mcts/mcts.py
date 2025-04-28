@@ -123,14 +123,14 @@ class MCTSNode(Generic[State, Action]):
             return 0.0
         elif self.is_terminal:
             if self.is_correct:
-                return self.max_min_multiplier * self.max_reward 
+                # return self.max_min_multiplier * self.max_reward 
                 # return self.max_min_multiplier * self.max_reward if self.max_reward > 1.0 else 1.0 * self.max_min_multiplier
             
-                # return 1.0
+                return 1.0
             else:
                 # return self.max_min_multiplier * self.min_reward if self.min_reward < -1.0 else -1.0 * self.max_min_multiplier
-                return self.max_min_multiplier * self.min_reward
-                # return -1.0
+                # return self.max_min_multiplier * self.min_reward
+                return -1.0
         # return self.rewards.mean().detach().item() + (self.value if self.parent is None else (self.value - self.parent.value))
         raise ValueError('Should not consider kl divergence here!')
     
@@ -401,6 +401,7 @@ class MCTSWDPOP(SearchAlgorithm, Generic[State, Action]):
         self.min_reward = 0.0
         self.max_q = 0.0
         self.min_q = 0.0
+        self.correct_flag = False
 
     def _get_simulated_pi(self, cur_node: MCTSNode, return_selection=False) -> list[float]:
         """
@@ -473,60 +474,60 @@ class MCTSWDPOP(SearchAlgorithm, Generic[State, Action]):
             node = self._puct_select(path[-1])
             path.append(node)
             if not additional_tree_search:
-                if self.max_reward < node.r:
-                    self.max_reward = node.r
+                # if self.max_reward < node.r:
+                #     self.max_reward = node.r
                     
-                if self.min_reward > node.r:    
-                    self.min_reward = node.r
+                # if self.min_reward > node.r:    
+                #     self.min_reward = node.r
                     
-                if self.max_q < node.Q:
-                    self.max_q = node.Q
-                if self.min_q > node.Q:
-                    self.min_q = node.Q
-                # if not (node.log_probs is None):
-                #     if node.is_terminal:
-                #         node_r = node.r
-                #     else:
-                #         node_r = (node.log_probs.sum() - node.ref_log_probs.sum()).detach().item()
-                #     if self.max_reward < node_r:
-                #         self.max_reward = node_r
+                # if self.max_q < node.Q:
+                #     self.max_q = node.Q
+                # if self.min_q > node.Q:
+                #     self.min_q = node.Q
+                if not (node.log_probs is None):
+                    if node.is_terminal:
+                        node_r = node.r
+                    else:
+                        node_r = (node.log_probs.sum() - node.ref_log_probs.sum()).detach().item()
+                    if self.max_reward < node_r:
+                        self.max_reward = node_r
                         
-                #     if self.min_reward > node_r:    
-                #         self.min_reward = node_r
+                    if self.min_reward > node_r:    
+                        self.min_reward = node_r
                         
-                #     if self.max_q < node.Q:
-                #         self.max_q = node.Q
-                #     if self.min_q > node.Q:
-                #         self.min_q = node.Q 
+                    if self.max_q < node.Q:
+                        self.max_q = node.Q
+                    if self.min_q > node.Q:
+                        self.min_q = node.Q 
         
         if not additional_tree_search:
             self._back_propagate(path)
             for node in path:
-                if self.max_reward < node.r:
-                    self.max_reward = node.r
+                # if self.max_reward < node.r:
+                #     self.max_reward = node.r
                     
-                if self.min_reward > node.r:    
-                    self.min_reward = node.r
+                # if self.min_reward > node.r:    
+                #     self.min_reward = node.r
                     
-                if self.max_q < node.Q:
-                    self.max_q = node.Q
-                if self.min_q > node.Q:
-                    self.min_q = node.Q
-                # if not (node.log_probs is None):
-                #     if node.is_terminal:
-                #         node_r = node.r
-                #     else:
-                #         node_r = (node.log_probs.sum() - node.ref_log_probs.sum()).detach().item()
-                #     if self.max_reward < node_r:
-                #         self.max_reward = node_r
+                # if self.max_q < node.Q:
+                #     self.max_q = node.Q
+                # if self.min_q > node.Q:
+                #     self.min_q = node.Q
+                if not (node.log_probs is None):
+                    if node.is_terminal:
+                        node_r = node.r
+                    else:
+                        node_r = (node.log_probs.sum() - node.ref_log_probs.sum()).detach().item()
+                    if self.max_reward < node_r:
+                        self.max_reward = node_r
                         
-                #     if self.min_reward > node_r:    
-                #         self.min_reward = node_r
+                    if self.min_reward > node_r:    
+                        self.min_reward = node_r
                         
-                #     if self.max_q < node.Q:
-                #         self.max_q = node.Q
-                #     if self.min_q > node.Q:
-                #         self.min_q = node.Q
+                    if self.max_q < node.Q:
+                        self.max_q = node.Q
+                    if self.min_q > node.Q:
+                        self.min_q = node.Q
             
         return path
     
@@ -574,6 +575,13 @@ class MCTSWDPOP(SearchAlgorithm, Generic[State, Action]):
     
     def _puct_select(self, node: MCTSNode) -> MCTSNode:
         xnode = max(node.children, key=self._puct)
+        return xnode
+    
+    def _uct(self, node: MCTSNode) -> float:
+        return node.Q + self.w_exp * np.sqrt(node.parent.N) / (1 + node.N)
+    
+    def _uct_select(self, node: MCTSNode) -> MCTSNode:
+        xnode = max(node.children, key=self._uct)
         return xnode
     
     def _addtional_expand_and_evaluate(self, node: MCTSNode, step: str, is_terminal_flag, max_reward=0.0, min_reward=0.0, policy_model=None) -> None | str:
@@ -641,6 +649,8 @@ class MCTSWDPOP(SearchAlgorithm, Generic[State, Action]):
                         is_correct = csr_equal(prediction, ('(' + solution[1].strip() + ')', ''))
                     else:
                         is_correct = math_equal(extract_answer(prediction), extract_answer(f'{solution[0]}\nThe answer is {solution[1]}'))
+                        if is_correct:
+                            self.correct_flag = True
             
             
             child = MCTSNode(state=None, action=action, parent=node, 

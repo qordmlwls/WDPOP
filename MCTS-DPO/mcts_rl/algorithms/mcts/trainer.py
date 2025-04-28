@@ -530,6 +530,7 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         self.mcts_searcher.search_algo.min_reward = 0.0
         self.mcts_searcher.search_algo.max_q = 0.0
         self.mcts_searcher.search_algo.min_q = 0.0
+        self.mcts_searcher.search_algo.correct_flag = False
 
         input_ids = prompt_only_batch['input_ids']
         attention_mask = prompt_only_batch['attention_mask']
@@ -551,6 +552,7 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         target_probs, Q_values, r_values, base_values, visit_counts, select_indexes = [], [], [], [], [], []
         cur_node = None
         no_valid_action_flag = False
+        
         while cur_node is None or not cur_node.is_terminal:
             if cur_node is not None and (self.tokenizer.eos_token_id in cur_node.action or self.tokenizer.convert_tokens_to_ids("<|eot_id|>") in cur_node.action):
                 cur_node.is_terminal = True
@@ -576,7 +578,8 @@ class MCTSWDPOPTrainer(TSRLTrainer):
             select_indexes.append(mcts_rst.next_action_idx)
             
             if self.args.n_actions == 1: break
-        if cur_node.is_terminal and cur_node.is_correct == False and len(prompt_only_batch.get('step_solution', [])) != 0 and no_valid_action_flag == False:
+        # if no_valid_action_flag == False and cur_node.is_terminal and cur_node.is_correct == False and len(prompt_only_batch.get('step_solution', [])) != 0:
+        if no_valid_action_flag == False and self.mcts_searcher.search_algo.correct_flag == False and len(prompt_only_batch.get('step_solution', [])) != 0:    
             print('Wrong answer, addtional tree search')
             self.number_of_wrong_answers += 1
             
@@ -690,12 +693,11 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         is_solution_correct = path_nodes[-1].is_correct
         is_terminal = path_nodes[-1].is_terminal
 
-        # sum_w = sum(step_ws)
-        # if is_solution_correct:
-        #     mean_w = sum(step_ws[:depth_limit]) / len(step_ws)
-        # else:
-        #     mean_w = sum(step_ws) / len(step_ws)
-        mean_w = sum(step_ws) / len(step_ws)
+        if is_solution_correct:
+            mean_w = sum(step_ws[:depth_limit]) / len(step_ws)
+        else:
+            mean_w = sum(step_ws) / len(step_ws)
+        # mean_w = sum(step_ws) / len(step_ws)
         
         return step_actions, step_ws, ref_probs, mean_w, full_texts, is_solution_correct, is_terminal
     
@@ -712,7 +714,7 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         solution: tuple = None,
         cur_max_new_tokens: int = 32,
     ) -> dict[str, Any]:
-        exec(f'''import pickle\nwith open('{self.args.output_dir}/mcts_rst.pkl', 'wb') as f: \n    pickle.dump(cur_node, f)''')
+        # exec(f'''import pickle\nwith open('{self.args.output_dir}/mcts_rst.pkl', 'wb') as f: \n    pickle.dump(cur_node, f)''')
         
         while cur_node.depth:
             cur_node = cur_node.parent
@@ -942,18 +944,6 @@ class MCTSWDPOPTrainer(TSRLTrainer):
             input_ids=combined_input_ids,
             attention_mask=combined_attention_mask,
         )
-        # torch.cuda.empty_cache()
-        # winner_log_probs_batch = self.compute_log_probs(
-        #     self.actor_model.module,
-        #     input_ids=winner_input_ids_batch,
-        #     attention_mask=winner_attention_mask_batch,
-        # )
-        # torch.cuda.empty_cache()
-        # loser_log_probs_batch = self.compute_log_probs(
-        #     self.actor_model.module,
-        #     input_ids=loser_input_ids_batch,
-        #     attention_mask=loser_attention_mask_batch,
-        # )
         winner_log_probs_batch = combined_log_probs[:n_winner]
         loser_log_probs_batch = combined_log_probs[n_winner:]
 
@@ -973,7 +963,17 @@ class MCTSWDPOPTrainer(TSRLTrainer):
         #         input_ids=loser_input_ids_batch,
         #         attention_mask=loser_attention_mask_batch,
         #     )
-
+        ############################# for testing ##############################
+        with torch.no_grad():
+            torch.cuda.empty_cache()
+            ref_log_probs = self.compute_log_probs(
+                self.actor_reference_model.module,
+                input_ids=combined_input_ids,
+                attention_mask=combined_attention_mask,
+            )
+            ref_winner_log_probs_batch = ref_log_probs[:n_winner]
+            ref_loser_log_probs_batch = ref_log_probs[n_winner:]
+        ###########################################################################
         # -----------------------------------
         # Accumulate WDPOP loss per sample.
         # -----------------------------------
@@ -996,23 +996,25 @@ class MCTSWDPOPTrainer(TSRLTrainer):
             else:
                 l_log_probs = loser_log_probs_batch[i][prompt_len - 1:]
 
-            # w_log_probs = winner_log_probs_batch[i][:w_len]
-            # l_log_probs = loser_log_probs_batch[i][:l_len]
-            # ref_w_log_probs = ref_winner_log_probs_batch[i][:w_len]
-            # ref_l_log_probs = ref_loser_log_probs_batch[i][:l_len]
+            ############################### for testing ##############################
+            if w_pad_len > 0:
+                w_ref_log_probs = ref_winner_log_probs_batch[i][prompt_len - 1: -w_pad_len]
+            else:
+                w_ref_log_probs = ref_winner_log_probs_batch[i][prompt_len - 1:]
+            if l_pad_len > 0:
+                l_ref_log_probs = ref_loser_log_probs_batch[i][prompt_len - 1: -l_pad_len]
+            else:
+                l_ref_log_probs = ref_loser_log_probs_batch[i][prompt_len - 1:]
+            ###########################################################################
 
             # Compute the overall log-ratio difference.
-            sum_winner_ratio = beta * (w_log_probs.sum() - sum(winner_ref_probs[i]))
-            sum_loser_ratio  = beta * (l_log_probs.sum() - sum(loser_ref_probs[i]))
-            # sum_loser_ratio  = beta * (l_log_probs.sum() - ref_l_log_probs.sum())
+            # sum_winner_ratio = beta * (w_log_probs.sum() - sum(winner_ref_probs[i]))
+            # sum_loser_ratio  = beta * (l_log_probs.sum() - sum(loser_ref_probs[i]))
 
+            ############################### for testing ##############################
+            sum_winner_ratio = beta * (w_log_probs.sum() - w_ref_log_probs.sum())
+            sum_loser_ratio  = beta * (l_log_probs.sum() - l_ref_log_probs.sum())
 
-            # sum_winner_ratio = beta * w_log_probs.sum() 
-            # sum_loser_ratio  = beta * l_log_probs.sum() 
-            # if num_step == 0:
-            #     sum_winner_ratio = beta * w_log_probs.sum()
-            #     sum_loser_ratio  = beta * l_log_probs.sum()
-            
             diff = sum_winner_ratio - sum_loser_ratio
 
             # Compute the hinge penalty for the winner trajectory.
@@ -1025,13 +1027,18 @@ class MCTSWDPOPTrainer(TSRLTrainer):
                 if running_idx == 0:
                     step_len = actions_t.size(-1) - prompt_len
                 step_log_theta = w_log_probs[running_idx: running_idx + step_len].sum()
-                # step_log_ref   = ref_w_log_probs[running_idx: running_idx + step_len].sum()
+                ############################# for testing ##############################
+                step_log_ref = w_ref_log_probs[running_idx: running_idx + step_len].sum()
+
+                ########################################################################
+
                 running_idx += step_len
                 # Hinge: beta * w_t * max(0, (log π_ref - log π_θ))
-                # w_t = 1.0
+
                 step_hinge += beta * w_t * torch.clamp(step_log_ref - step_log_theta, min=0.0)
-                # if num_step == 0:
-                #     step_hinge += beta * w_t * (-step_log_theta)
+
+                
+
             hinge_penalty = lambda_ * step_hinge
 
             # Compute the WDPOP loss for this sample.

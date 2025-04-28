@@ -93,6 +93,7 @@ class TSRLTrainer(TrainerBase):  # pylint: disable=too-many-instance-attributes
         self.min_q = 0.0
         self.max_reward = 0.0
         self.min_reward = 0.0
+        # self.correct_flag = False
         
 
         

@@ -312,6 +312,8 @@ class StepLMConfig(SearchConfig):
                                             self.base_tokenizer.decode(seq[input_ids.size(-1):], 
                                                                     skip_special_tokens=self.model_type != 'llama3', 
                                                                     clean_up_tokenization_spaces=False)
+
+ 
                 match1 = re.search(next_step_marker_pattern, full_generated, flags=re.IGNORECASE)
                 match2 = re.search(next2_step_marker_pattern, full_generated, flags=re.IGNORECASE)
                 match_answer = re.search(answer_marker_pattern, full_generated, flags=re.IGNORECASE)
@@ -322,6 +324,10 @@ class StepLMConfig(SearchConfig):
                     full_generated = full_generated[: match_answer.start()]
                 else:
                     pass
+                ## prevent empty generation e.g. ## Step 1
+                test = full_generated.replace('\n', '').replace(' ', '').replace('\t', '').replace('##Step', '')
+                if len(test) < 3:
+                    full_generated = ''
                 raw_full_generated = full_generated
                 if self.model_type != 'llama3':
                     full_generated = full_generated.split(EVAL_PROMPT_USER.split(':')[0])[0]
@@ -462,23 +468,25 @@ class StepLMConfig(SearchConfig):
             )
             torch.cuda.empty_cache()
             print("logits")
-            # if self.ref_state_dict is not None:
-            #     self.update_policy_weights_with_ref_model(policy_model.module)
-            logits, hidden_states = self._get_logits(seq_input_ids, attention_mask=seq_attention_mask, model=policy_model.module)
-            # dist.barrier()
-            log_probs = self._gather_log_probabilities(logits[input_ids.size(-1)-1:-1, :], gen_ids.to(logits.device)) # input_ids.size(-1) -1: -1 input id's last token for predicting the next token and -1 since the prediction of the last token is not needed 
-            embs = hidden_states[input_ids.size(-1):]
-            # if add_kl:
-            torch.cuda.empty_cache()
-            # if self.ref_state_dict is not None:
-            #     self.update_policy_weights_with_intermidiate_state(policy_model.module)
-            ref_logits, _ = self._get_logits(seq_input_ids, attention_mask=seq_attention_mask, model=self.ref_policy_model.module)
-            # dist.barrier()
-            ref_log_probs = self._gather_log_probabilities(ref_logits[input_ids.size(-1)-1:-1, :], gen_ids.to(ref_logits.device))
-            # else:
-            #     ref_log_probs = None
+            
+            # logits, hidden_states = self._get_logits(seq_input_ids, attention_mask=seq_attention_mask, model=policy_model.module)
+ 
+            # log_probs = self._gather_log_probabilities(logits[input_ids.size(-1)-1:-1, :], gen_ids.to(logits.device)) # input_ids.size(-1) -1: -1 input id's last token for predicting the next token and -1 since the prediction of the last token is not needed 
+            # embs = hidden_states[input_ids.size(-1):]
+ 
+            # # if add_kl:
+            # torch.cuda.empty_cache()
+            # ref_logits, _ = self._get_logits(seq_input_ids, attention_mask=seq_attention_mask, model=self.ref_policy_model.module) 
+            # ref_log_probs = self._gather_log_probabilities(ref_logits[input_ids.size(-1)-1:-1, :], gen_ids.to(ref_logits.device))
+
+            ################################### for testing ####################################
+            log_probs, embs = torch.zeros_like(seq_input_ids), torch.zeros_like(seq_input_ids)  
+            ref_log_probs, _ = torch.zeros_like(seq_input_ids), torch.zeros_like(seq_input_ids)
+            ####################################################################################
+
             results.append((gen_ids, (prompt, text), (log_probs, ref_log_probs), embs))
-        return self._filter_via_similarity(results)
+        # return self._filter_via_similarity(results)
+        return results
     
     @torch.no_grad()
     def get_additional_actions(self, policy_model, state: StepLMState, is_terminal_flag, step: str) -> tuple:
